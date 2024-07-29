@@ -215,3 +215,28 @@ If you want to continue a workflow and you are inside a tmate session, just crea
 ## Connection string / URL is not visible
 
 The connection string will be written in the logs every 5 seconds. For more information checkout issue [#1](https://github.com/mxschmitt/action-tmate/issues/1).
+
+
+
+
+
+通过tmate连接，默认15分钟自动断开，但是可通过touch /tmp/keepalive命令解除。
+
+连接成功之后，大概几分钟不进行操作，将会失去控制
+
+name: Ubuntu
+on: [push]
+jobs:
+  Ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Setup Debug Session
+      uses: csexton/debugger-action@master
+使用
+创建一个工作流
+然后把例子代码复制到.github/workflows/main.yml中
+Start commit提交更改
+查看操作日志，提取ssh并连接
+查看操作日志找到类似ssh 1234aeafasgagaaffav@sfo2.tmate.io代码，然后复制到终端就可以连接上了。
+
+可以使用ssh工具尝试连接，git终端连接也可以。
