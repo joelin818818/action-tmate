@@ -1,0 +1,15 @@
+name: Run Script on Ubuntu Latest
+
+on:
+  workflow_dispatch: # 依然保留手动触发
+
+jobs:
+  run-on-ubuntu:
+    runs-on: ubuntu-latest # 指定使用最新的 Ubuntu GitHub 托管 runner
+
+    steps:
+      - name: Checkout Code # 检出代码，虽然对于这个特定任务可能不是必须的，但通常是好习惯
+        uses: actions/checkout@v4
+
+      - name: Download and Run Script # 下载并执行您指定的脚本
+        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
