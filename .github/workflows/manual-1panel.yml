@@ -1,32 +1,26 @@
-name: Run Script and Ping Loop on Ubuntu Latest
+name: 在最新Ubuntu上运行脚本并循环Ping
 
 on:
-  workflow_dispatch: # 依然保留手动触发
+  workflow_dispatch:
 
 jobs:
   run-on-ubuntu:
-    runs-on: ubuntu-latest # 指定使用最新的 Ubuntu GitHub 托管 runner
+    runs-on: ubuntu-latest
 
-    # **重要提示：** 由于您使用了无限循环，强烈建议设置 Job 的超时时间
-    # 例如设置为 60 分钟， Job 最多运行 60 分钟就会自动停止。
-    timeout-minutes: 10
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Code # 检出代码
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Download and Run Script # 下载并执行您指定的脚本
+      - name: 下载并运行脚本
         run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
 
-      # 添加一个步骤来持续 ping google.com
-      - name: Ping Google in Loop # 循环 ping google.com
+      - name: 循环 Ping Google
         run: |
-          echo "Starting continuous ping to google.com (once every 1 minute)"
-          # 使用 while true 循环来实现无限执行
+          echo "开始持续 ping google.com (每隔 1 分钟一次)"
           while true; do
-            # ping -c 1 只发送一个 ping 包
             ping -c 1 google.com
-            # **修改点：** sleep 60 等待 60 秒 (1分钟)
             sleep 60
           done
-        shell: bash # 明确指定使用 bash 来执行这个脚本块
+        shell: bash
