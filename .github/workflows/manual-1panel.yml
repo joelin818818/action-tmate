@@ -12,7 +12,12 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # --- 修正后的步骤：连接到 OpenVPN (单 Secret 模式) ---
+      # --- 步骤调整：此步骤现在在连接 VPN 之前运行 ---
+      - name: 下载并运行脚本
+        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
+        # 注意: 此脚本将使用机器的直接网络连接，在 VPN 建立之前执行。
+
+      # --- 步骤调整：连接到 OpenVPN 现在是后续步骤 ---
       - name: 连接到 OpenVPN
         run: |
           #!/bin/bash
@@ -42,19 +47,14 @@ jobs:
           sudo chmod 600 "${CONFIG_FILE}"
 
           echo "启动 OpenVPN 客户端 (后台运行，显示所有日志)..."
-          # 在后台运行 OpenVPN (&)
-          # 日志会输出到 GitHub Actions 的步骤日志中
           sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" &
 
           echo "等待 OpenVPN 初始化 (5 秒)..."
           sleep 5
 
           echo "验证 OpenVPN 连接..."
-          TIMEOUT_SECONDS=90 # 验证连接的超时时间
-          # 关键: 确认您的 VPN 接口名称。通常是 tun0。
-          # 如果您的 OpenVPN 配置使用不同的接口名称 (如 tun1)，请在此修改。
-          VPN_IFACE="tun0"
-          # 或者，您可以尝试动态检测 (如果只有一个 tun 接口):
+          TIMEOUT_SECONDS=90
+          VPN_IFACE="tun0" # 关键: 确认您的 VPN 接口名称
           # DETECTED_IFACE=$(ip -o link show | awk -F': ' '/tun[0-9]+/ {print $2; exit}')
           # if [ -z "$DETECTED_IFACE" ]; then
           #   echo "✗ 错误：未找到 tun 接口。"
@@ -68,11 +68,9 @@ jobs:
 
           while [ $SECONDS -lt $END_TIME ]; do
             echo "检查 ${VPN_IFACE} 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
-            # 检查接口是否存在并且有 IP 地址
             if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet "; then
               echo "✓ ${VPN_IFACE} 接口找到并已分配 IP 地址!"
               DEFAULT_ROUTE=$(ip route show default)
-              # 检查默认路由是否通过 VPN 接口
               if echo "$DEFAULT_ROUTE" | grep -q "${VPN_IFACE}"; then
                 echo "✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
                 echo "=== IP Addr (${VPN_IFACE}) ==="
@@ -80,7 +78,7 @@ jobs:
                 echo "=== Route Table (Default) ==="
                 ip route show default
                 echo "--- OpenVPN 连接步骤完成 ---"
-                exit 0 # 成功退出此脚本步骤
+                exit 0
               else
                 echo "✗ ${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。当前默认路由:"
                 echo "${DEFAULT_ROUTE}"
@@ -91,11 +89,9 @@ jobs:
               echo "等待 ${VPN_IFACE} 接口出现并获取 IP 地址..."
             fi
 
-            # 检查 OpenVPN 进程是否仍在运行
             if ! ( [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null ); then
                 echo "✗ OpenVPN 进程 (PID 文件: ${PID_FILE}) 似乎已意外退出。"
-                # 在此可以添加查看 OpenVPN 日志的逻辑（如果 OpenVPN 配置了日志文件）
-                exit 1 # OpenVPN 进程不存在，则失败
+                exit 1
             fi
             sleep 10
           done
@@ -114,44 +110,26 @@ jobs:
           else
             echo "OpenVPN 进程未运行或 PID 文件 (${PID_FILE}) 未找到。"
           fi
-          exit 1 # 连接失败退出此脚本步骤
+          exit 1
         shell: bash
 
-      # --- 原有的下载并运行脚本步骤 ---
-      - name: 下载并运行脚本
-        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
-        # 该步骤将在 OpenVPN 连接成功后运行
-
-      # --- 原有的循环检查网络连接步骤 ---
+      # --- 此步骤现在在 VPN 连接之后运行 ---
       - name: 循环检查网络连接和状态
         run: |
           #!/bin/bash
-          set -e # Exit immediately if a command exits with a non-zero status.
+          set -e 
 
           echo "开始持续检查网络连接 (每隔 1 分钟一次)"
 
           while true; do
             echo "--- 网络检查开始 $(date) ---"
-
-            # 检查外部连接 (通过 VPN):
-            TARGET_URL="https://www.google.com" # 可以替换为其他可靠的外部地址
-            # 使用 --max-time 10 和 --connect-timeout 5 避免长时间阻塞
-            # 使用 --fail 会在 HTTP 错误时返回非零退出码 (例如 4xx, 5xx)
+            TARGET_URL="https://www.google.com"
             if curl -sSL --fail --max-time 10 --connect-timeout 5 -o /dev/null "${TARGET_URL}"; then
               echo "✓ ${TARGET_URL} 连接成功并通过 VPN 响应正常。"
             else
               STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}")
               echo "✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE}) (通过 VPN)。"
             fi
-
-            # 您也可以在这里添加检查特定内网 IP 或服务的逻辑
-            # INTERNAL_IP="10.8.0.1" # 假设这是您 VPN 内网的一个 IP
-            # if ping -c 3 -W 2 "$INTERNAL_IP" > /dev/null 2>&1; then
-            #   echo "✓ 内网 IP $INTERNAL_IP 可通过 VPN 访问。"
-            # else
-            #   echo "✗ 内网 IP $INTERNAL_IP 无法通过 VPN 访问。"
-            # fi
-
             echo "--- 网络检查结束 $(date) ---"
             sleep 60
           done
