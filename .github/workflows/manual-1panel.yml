@@ -26,6 +26,8 @@ jobs:
           NET_CHECK_PID=""
           # OpenVPN守护进程的PID文件 (由 --writepid 生成)
           OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # 更改文件名避免冲突
+          # 用于存储自动检测到的VPN接口名称
+          DETECTED_VPN_IFACE=""
 
           # 清理后台进程的函数
           cleanup_processes() {
@@ -123,11 +125,12 @@ jobs:
               fi
 
 
-              echo "[VPN任务] 验证 OpenVPN 连接..."
-              local TIMEOUT_SECONDS=180
-              local VPN_IFACE="tun0" # 关键: 确认您的 VPN 接口名称，OpenVPN 通常是 tun0
-
+              echo "[VPN任务] 验证 OpenVPN 连接状态并检测接口..."
+              # --- 增加超时时间到 300 秒 (5分钟) ---
+              local TIMEOUT_SECONDS=300
               local END_TIME=$((SECONDS + TIMEOUT_SECONDS))
+              local found_vpn_iface="" # 用于暂存找到的接口名称
+
               while [ $SECONDS -lt $END_TIME ]; do
                 # 检查 OpenVPN 守护进程是否仍在运行 (通过PID文件)
                 if ! ( [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null ); then
@@ -135,28 +138,49 @@ jobs:
                   exit 1 # 表示此函数失败，触发 cleanup trap
                 fi
 
-                echo "[VPN任务] 检查 ${VPN_IFACE} 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
-                if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet "; then
-                  DEFAULT_ROUTE=$(ip route show default)
-                  if echo "$DEFAULT_ROUTE" | grep -q "${VPN_IFACE}"; then
-                    echo "[VPN任务] ✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
-                    echo "[VPN任务] === IP Addr (${VPN_IFACE}) ==="
-                    ip addr show "${VPN_IFACE}"
+                echo "[VPN任务] 尝试查找并验证 tun/tap 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
+
+                # 查找所有可能的 tun 或 tap 接口
+                local potential_ifaces=$(ip link show | awk '/(tun|tap)[0-9]+:/{print $2}' | sed 's/://')
+                found_vpn_iface="" # 重置找到的接口名称，防止上一次循环的残留
+
+                # 遍历潜在接口，检查其状态和路由
+                for iface in ${potential_ifaces}; do
+                    # 检查接口是否 UP 并且有 IP 地址
+                    if ip addr show "$iface" | grep -q "state UP" && ip addr show "$iface" | grep -q "inet "; then
+                        # 检查默认路由是否通过这个接口
+                        if ip route show default | grep -q "$iface"; then
+                            # 找到了符合条件的接口
+                            found_vpn_iface="$iface"
+                            break # 跳出内层循环 (找到接口了)
+                        else
+                             # 接口 UP 且有 IP，但默认路由没走它
+                             echo "[VPN任务] 接口 ${iface} 已出现并有 IP，但默认路由未通过它。"
+                        fi
+                    # else: 接口存在，但不是 UP 状态或还没 IP - 继续等待
+                    fi
+                done
+
+                if [ -n "$found_vpn_iface" ]; then
+                    # 如果找到了符合条件的接口
+                    echo "[VPN任务] ✓ VPN 连接成功，检测到接口 ${found_vpn_iface}，默认路由通过它。"
+                    echo "[VPN任务] === IP Addr (${found_vpn_iface}) ==="
+                    ip addr show "$found_vpn_iface"
                     echo "[VPN任务] === Route Table (Default) ==="
                     ip route show default
                     echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
+                    # 将检测到的接口名称导出到主脚本的环境变量中
+                    export DETECTED_VPN_IFACE="$found_vpn_iface"
                     exit 0 # 表示此函数成功
-                  else
-                    echo "[VPN任务] ✗ ${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。"
-                  fi
                 else
-                  echo "[VPN任务] 等待 ${VPN_IFACE} 接口出现并获取 IP 地址..."
+                    # 没有找到符合条件的接口，继续等待
+                     echo "[VPN任务] 未在任何 tun/tap 接口上检测到默认路由。继续等待..."
                 fi
 
-                sleep 10
+                sleep 10 # 每次检查之间等待10秒
               done
 
-              echo "[VPN任务] ✗ OpenVPN 连接超时或未建立默认路由（${TIMEOUT_SECONDS}秒内）。"
+              echo "[VPN任务] ✗ OpenVPN 连接超时（${TIMEOUT_SECONDS}秒内未检测到有效接口和默认路由）。"
               # 触发 cleanup trap 并退出
               exit 1 # 表示此函数失败
             }
@@ -194,14 +218,22 @@ jobs:
                 echo "[网络检查任务] 等待30秒，确保网络环境稳定..."
                 sleep 30
 
-                local VPN_IFACE="tun0" # 再次确认接口
-                echo "[网络检查任务] 循环开始前的 VPN 状态简要检查:"
-                if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet " && ip route show default | grep -q "${VPN_IFACE}"; then
+                # 使用自动检测到的接口名称进行检查，如果未设置则退回到 tun0 (理论上 VPN_START_PID 成功后此变量应已设置)
+                local VPN_IFACE="${DETECTED_VPN_IFACE:-tun0}"
+                echo "[网络检查任务] 循环开始前的 VPN 状态简要检查 (接口: ${VPN_IFACE}):"
+
+                # 检查接口是否存在、有IP、默认路由是否通过它
+                if [ -n "$VPN_IFACE" ] && ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet " && ip route show default | grep -q "${VPN_IFACE}"; then
                   echo "[网络检查任务] ✓ VPN 接口 (${VPN_IFACE}) 在循环检查前确认可用，默认路由正确。"
                 else
                   echo "[网络检查任务] ⚠ 警告: VPN 接口 (${VPN_IFACE}) 在循环检查前似乎未完全就绪或默认路由不通过VPN。检查将继续进行，但可能失败。"
                   ip route show default || echo "无法获取默认路由"
-                  ip addr show "${VPN_IFACE}" || echo "${VPN_IFACE} 接口不存在"
+                   # 只有在检测到接口名称不为空时才尝试显示其状态
+                  if [ -n "$VPN_IFACE" ]; then
+                      ip addr show "${VPN_IFACE}" || echo "${VPN_IFACE} 接口不存在或获取状态失败"
+                  else
+                       echo "未检测到VPN接口名称 ($DETECTED_VPN_IFACE 变量为空)."
+                  fi
                 fi
 
 
@@ -232,6 +264,8 @@ jobs:
           echo "启动 VPN 连接任务, 脚本执行任务, 和持续网络检查任务..."
 
           # 启动所有任务到后台
+          # 注意： run_network_check_loop 在启动时 DETECTED_VPN_IFACE 可能还未被设置
+          # 它会在自己的启动后检查等待 VPN 连接函数设置该变量。
           connect_vpn_and_verify &
           VPN_START_PID=$! # 获取 VPN 启动函数进程的 PID
           echo "VPN 连接任务启动进程 PID: ${VPN_START_PID}"
@@ -244,6 +278,7 @@ jobs:
           NET_CHECK_PID=$! # 获取网络检查循环进程的 PID
           echo "持续网络检查任务进程 PID: ${NET_CHECK_PID}"
 
+
           echo "等待关键设置任务 (VPN 连接和 脚本执行) 完成..."
 
           VPN_TASK_SUCCESS=false
@@ -251,13 +286,22 @@ jobs:
           OVERALL_SUCCESS=false
 
           # 等待 VPN 任务完成并检查结果
-          # 注意：这里等待的是 connect_vpn_and_verify 函数所在的子shell进程
-          # 该函数内部会等待 OpenVPN 守护进程启动并验证连接
+          # 如果此任务成功，它将设置 DETECTED_VPN_IFACE 变量
           wait $VPN_START_PID
           VPN_EXIT_STATUS=$?
           if [ $VPN_EXIT_STATUS -eq 0 ]; then
               echo "✓ VPN 连接任务成功完成。"
               VPN_TASK_SUCCESS=true
+              # 确保变量已设置
+              if [ -z "$DETECTED_VPN_IFACE" ]; then
+                 echo "✗ 警告：VPN 连接任务成功退出，但未设置 DETECTED_VPN_IFACE 变量！"
+                 # 这种情况不应该发生，如果发生则可能逻辑有问题
+                 VPN_TASK_SUCCESS=false # 标记为逻辑失败
+                 # 继续清理并退出
+                 exit 1
+              else
+                 echo "→ 检测到的 VPN 接口名称: ${DETECTED_VPN_IFACE}"
+              fi
           else
               echo "✗ VPN 连接任务失败 (退出码: $VPN_EXIT_STATUS)。"
               # cleanup trap 会在脚本退出时执行
