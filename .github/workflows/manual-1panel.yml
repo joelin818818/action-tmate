@@ -1,4 +1,4 @@
-name: 在最新Ubuntu上运行脚本并循环检查网络 (通过VPN)
+name: 在最新Ubuntu上运行脚本并循环检查网络 (通过OpenVPN)
 
 on:
   workflow_dispatch:
@@ -7,213 +7,125 @@ jobs:
   run-on-ubuntu:
     runs-on: ubuntu-latest
 
-    timeout-minutes: 60
+    timeout-minutes: 60 # Job timeout
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 连接到 L2TP/IPsec VPN
+      # --- 新增步骤：连接到 OpenVPN (单 Secret 模式) ---
+      - name: 连接到 OpenVPN
         run: |
           #!/bin/bash
           set -eux # 遇到错误立即退出，打印执行的命令
 
-          # 从 secrets 获取 VPN 服务器 IP
-          VPN_SERVER_IP="${{ secrets.VPN_IP }}"
-          echo "--- 开始连接 L2TP/IPsec VPN ---"
-          echo "VPN Server: ${VPN_SERVER_IP}"
-          # 安全警告：请勿在这里或 Job 日志中直接 echo secrets 的值！
+          echo "--- 开始连接 OpenVPN ---"
 
-          # 1. 安装必要的软件包
-          echo "安装 VPN 软件包 (strongswan, xl2tpd)..."
+          # 从 secrets 获取完整的 OpenVPN 配置内容
+          # 安全警告：请勿在这里或 Job 日志中直接 echo secrets 的值！
+          OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
+
+          # 1. 安装 OpenVPN 软件包
+          echo "安装 OpenVPN 软件包..."
           # 检查软件包是否已安装，避免重复安装和更新
-          if ! dpkg -s strongswan xl2tpd > /dev/null 2>&1; then
+          if ! dpkg -s openvpn > /dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y strongswan xl2tpd
+            sudo apt-get install -y openvpn
           else
-            echo "所需的 VPN 软件包已安装."
+            echo "OpenVPN 软件包已安装."
           fi
 
-          # 2. 停止服务 (如果正在运行)
-          echo "停止可能冲突的服务..."
-          sudo systemctl stop strongswan || true # || true 避免服务未运行导致脚本失败
-          sudo systemctl stop xl2tpd || true
-          sleep 2 # 给服务一点时间停止
+          # 2. 创建配置目录和文件
+          CONFIG_DIR="/etc/openvpn/client"
+          echo "创建配置目录: ${CONFIG_DIR}"
+          sudo mkdir -p ${CONFIG_DIR}
+          sudo chmod 700 ${CONFIG_DIR} # 限制权限
 
-          # 3. 配置 IPsec (strongswan)
-          echo "配置 IPsec (/etc/ipsec.conf, /etc/ipsec.secrets)..."
-          # 将 IPsec 配置内容写入 /etc/ipsec.conf
-          # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进
-          sudo tee /etc/ipsec.conf > /dev/null <<EOF
-          config setup
-            charondebug="ike 1, cfg 1, net 1, esp 1, dmp 1" # 根据需要调整调试级别
-            uniqueidentity=no # 部分 VPN 设置可能需要
-            strictcrlpolicy=no # 根据服务器 CRL 策略可能需要调整
+          echo "创建 OpenVPN 配置文件: ${CONFIG_DIR}/client.conf (从 Secret)"
+          # 将完整的 .ovpn 文件内容 (从 Secret 获取) 写入 client.conf
+          # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进 (10个空格)
+          sudo tee ${CONFIG_DIR}/client.conf > /dev/null <<EOF
+${OPENVPN_CONFIG_CONTENT}
+          EOF # <--- 这个 EOF 必须和上面 'sudo tee ${CONFIG_DIR}/client.conf ...' 那行有相同的缩进 (10个空格)
+          sudo chmod 600 ${CONFIG_DIR}/client.conf # 设置严格权限
 
-          conn myvpn
-            keyexchange=ikev1
-            ikelifetime=60m
-            keylife=20m
-            rekeymargin=3m
-            keyingtries=1
-            authby=secret # 使用预共享密钥认证
-            left=%any # 客户端可以是任意 IP
-            leftsourceip=%config # 从配置获取客户端源 IP
-            leftfirewall=yes # 启用防火墙规则
-            right=${VPN_SERVER_IP} # **使用变量：** VPN Server IP
-            rightsubnet=0.0.0.0/0 # 期望所有流量通过 VPN 路由
-            type=transport # L2TP/IPsec 使用传输模式
-            auto=add # 自动加载连接定义
-          EOF # <--- 这个 EOF 必须和上面 'sudo tee /etc/ipsec.conf ...' 那行有相同的缩进 (10个空格)
-
-          # 将 IPsec 预共享密钥写入 /etc/ipsec.secrets
-          # 使用 secrets 安全地注入 PSK
-          # 注意：这一行没有 <<EOF ... EOF 语法
-          # 请确保这一行有正确的缩进 (10个空格)
-          echo "%any ${VPN_SERVER_IP} : PSK \"${{ secrets.VPN_PSK }}\"" | sudo tee /etc/ipsec.secrets > /dev/null
-          # 紧接着的这一行也要有正确的缩进 (10个空格)
-          sudo chmod 600 /etc/ipsec.secrets # 设置严格权限
-
-          # 4. 配置 L2TP (xl2tpd) 和 PPP
-          echo "配置 L2TP (/etc/xl2tpd/xl2tpd.conf) 和 PPP (/etc/ppp/options.l2tpd.client)..."
-          # 将 xl2tpd 配置写入 /etc/xl2tpd/xl2tpd.conf
-          # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进
-          sudo tee /etc/xl2tpd/xl2tpd.conf > /dev/null <<EOF
-          [global]
-          # port = 1701 # 默认 L2TP 端口
-
-          [lac myvpn_connection] # 定义一个 L2TP 连接
-          lns = ${VPN_SERVER_IP} # **使用变量：** VPN 服务器 IP
-          ppp debug = yes # 启用 PPP 调试日志
-          pppoptfile = /etc/ppp/options.l2tpd.client # PPP 选项文件路径
-          require authentication = yes # 要求认证
-          EOF # <--- 这个 EOF 必须和上面 'sudo tee /etc/xl2tpd/xl2tpd.conf ...' 那行有相同的缩进 (10个空格)
-
-          # 创建 PPP options 文件 for L2TP client
-          # 使用 secrets 安全地注入用户名和密码
-          # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进
-          sudo tee /etc/ppp/options.l2tpd.client > /dev/null <<EOF
-          # Authentication
-          name "${{ secrets.VPN_USERNAME }}" # VPN 用户名 (从 secrets 获取)
-          password "${{ secrets.VPN_PASSWORD }}" # VPN 密码 (从 secrets 获取)
-
-          # Common options
-          unit 0 # 分配给 ppp0 接口
-          #ipcp-accept-local
-          #ipcp-accept-remote
-          #require-chap # 检查服务器是否要求 CHAP
-          require-mschap-v2 # Windows L2TP/IPsec 服务器常用
-          # refuse-chap # 拒绝 CHAP
-          # refuse-mschap # 拒绝 MS-CHAP
-
-          # DNS - 如果需要通过 VPN 访问内网 DNS 服务器，这很重要
-          usepeerdns # 尝试从 VPN 服务器获取 DNS 配置
-          # 如果 usepeerdns 不工作，可以取消注释手动设置 DNS：
-          # ms-dns 192.168.1.254 # 来自图片
-          # ms-dns 42.240.136.88 # 来自图片
-
-          # IP configuration
-          # noipdefault # 不要默认使用对端 IP 作为默认路由
-          defaultroute # **关键：** 添加默认路由通过此连接，确保流量经过 VPN
-          # replacedefaultroute # 替换现有默认路由
-
-          # Other options
-          lock # 锁定串行设备
-          debug # 启用 PPP 调试日志
-
-          # LCP echo
-          lcp-echo-interval 30 # 发送 LCP echo 请求间隔
-          lcp-echo-failure 5 # 失败次数达到此值时断开
-
-          # MTU/MRU - 如果需要，使用图片中的值 (1400)，否则通常默认值即可
-          # mtu 1400
-          # mru 1400
-
-          persist # 保持尝试连接
-          maxfail 10 # 最大连接失败尝试次数
-          EOF # <--- 这个 EOF 必须和上面 'sudo tee /etc/ppp/options.l2tpd.client ...' 那行有相同的缩进 (10个空格)
-          sudo chmod 600 /etc/ppp/options.l2tpd.client # 设置严格权限，检查缩进
-
-          # 5. 启动服务
-          echo "启动 IPsec 和 xl2tpd 服务..."
-          sudo systemctl daemon-reload # 重载 systemd 配置
-          sudo systemctl start strongswan
-          sudo systemctl start xl2tpd
-
-          # 给服务一点时间初始化
-          sleep 5
-
-          # 确保 IPsec 已加载并状态良好
-          echo "检查 IPsec 状态..."
-          sudo ipsec status || { # 检查 IPsec 状态，如果失败则打印状态并退出
-              echo "IPsec 服务启动或配置有问题. IPsec status:"
-              sudo ipsec status # 失败时打印状态
+          # 3. 启动 OpenVPN 客户端
+          echo "启动 OpenVPN 客户端..."
+          # 使用 --config 指向创建的配置文件
+          # 使用 --daemon 在后台运行，并将日志和 PID 写入文件
+          # 使用 || { ...; exit 1; } 结构捕获启动失败并退出 Job
+          sudo openvpn --config ${CONFIG_DIR}/client.conf --daemon --log ${CONFIG_DIR}/openvpn.log --writepid /tmp/openvpn.pid || {
+              echo "✗ OpenVPN 客户端启动失败."
+              # 打印日志以帮助调试
+              if [ -f "${CONFIG_DIR}/openvpn.log" ]; then
+                  echo "=== OpenVPN Logs ==="
+                  cat ${CONFIG_DIR}/openvpn.log
+              fi
               exit 1
           }
-          echo "IPsec 服务状态良好."
 
-          # 6. 发起 VPN 连接
-          echo "发起 VPN 连接 'myvpn_connection'..."
-          # 向 xl2tpd 控制接口发送连接命令
-          echo "c myvpn_connection" | sudo tee /var/run/xl2tpd/l2tp-control > /dev/null
+          # 给 OpenVPN 一点时间建立连接
+          echo "等待 OpenVPN 连接建立..."
+          sleep 10
 
-          # 7. 验证连接 (关键步骤!)
-          echo "等待并验证 VPN 连接 (ppp0 接口)..."
-          timeout=90 # 增加 VPN 连接尝试的等待时间
-          while [ $timeout -gt 0 ]; do # 循环等待直到 ppp0 接口出现或超时
-            # 检查 ppp0 接口是否存在
-            if ip addr show ppp0 > /dev/null 2>&1; then
-              echo "VPN ppp0 接口找到!"
-              # 检查默认路由是否通过 ppp0 接口
-              if ip route show default | grep "ppp0" > /dev/null; then
-                 echo "✓ VPN 连接成功，默认路由通过 ppp0."
-                 ip addr show ppp0 # 显示分配的 IP 地址
+          # 4. 验证连接 (关键步骤!)
+          echo "验证 OpenVPN 连接..."
+          timeout=60 # 等待连接的最长时间
+          VPN_IFACE="tun0" # OpenVPN 使用 dev tun 通常会在 Linux 创建 tun0 接口
+
+          while [ $timeout -gt 0 ]; do
+            # 检查 VPN 接口 (tun0) 是否存在且已获得 IP 地址
+            if ip addr show ${VPN_IFACE} > /dev/null 2>&1 && ip addr show ${VPN_IFACE} | grep "inet " > /dev/null; then
+              echo "${VPN_IFACE} 接口找到并已分配 IP 地址!"
+              # 检查默认路由是否通过 VPN 接口
+              if ip route show default | grep "${VPN_IFACE}" > /dev/null; then
+                 echo "✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
+                 ip addr show ${VPN_IFACE} # 显示分配的 IP 地址
                  ip route show # 显示路由表
                  # 可选：ping 一个已知的 VPN 内网 IP 地址来确认路由是否工作
                  # 替换 <internal_vpn_ip> 为您 VPN 内网中一个确定可以 ping 通的 IP
-                 # Example: ping -c 3 192.168.230.1 && echo "Internal ping successful." || echo "Internal ping failed."
+                 # Example: ping -c 3 196.168.230.1 && echo "Internal ping successful." || echo "Internal ping failed."
                  break # 如果连接成功且路由正确，退出等待循环
               else
-                 echo "ppp0 接口已存在，但默认路由未通过 VPN。可能连接未完全建立或配置问题。"
+                 echo "${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。可能连接未完全建立或配置问题。"
                  ip route show
               fi
             else
-              echo "等待 ppp0 接口... 剩余 $timeout 秒"
+              echo "等待 ${VPN_IFACE} 接口并获取 IP 地址... 剩余 $timeout 秒"
             fi
 
             sleep 10 # 每 10 秒检查一次
             timeout=$((timeout - 10))
           done
 
-          # 最终检查，如果 VPN 连接或默认路由未建立则失败 Job
-          if ! ip addr show ppp0 > /dev/null 2>&1 || ! ip route show default | grep "ppp0" > /dev/null; then
-            echo "✗ VPN 连接失败或未建立默认路由。"
+          # 最终检查，如果连接失败则失败 Job
+          if ! ip addr show ${VPN_IFACE} > /dev/null 2>&1 || ! ip route show default | grep "${VPN_IFACE}" > /dev/null; then
+            echo "✗ OpenVPN 连接失败或未建立默认路由。"
             # 打印日志以帮助调试
-            echo "=== IPsec Logs ==="
-            # 获取 strongswan 和 charon 服务的日志
-            sudo journalctl -u strongswan -u charon --since "last boot" --no-pager -o cat || true
-            echo "=== xl2tpd Logs ==="
-             # 获取 xl2tpd 服务的日志
-            sudo journalctl -u xl2tpd --since "last boot" --no-pager -o cat || true
-            echo "=== pppd Logs (from syslog/daemon.log) ==="
-            # pppd 日志通常在 syslog 或 daemon.log 中
-            sudo grep pppd /var/log/syslog --since "last boot" -n 100 || true
-            sudo grep pppd /var/log/daemon.log --since "last boot" -n 100 || true
-
+            if [ -f "${CONFIG_DIR}/openvpn.log" ]; then
+                echo "=== OpenVPN Logs ==="
+                cat ${CONFIG_DIR}/openvpn.log
+            fi
             echo "=== Route Table ==="
             ip route show
             echo "=== IP Addr ==="
             ip addr show
             echo "==================="
+            # 尝试停止 OpenVPN 客户端进程 (如果启动了但连接失败)
+            if [ -f "/tmp/openvpn.pid" ]; then
+                sudo kill $(cat /tmp/openvpn.pid) || true
+            fi
             exit 1 # 失败 Job
           fi
 
-          echo "--- L2TP/IPsec VPN 连接步骤完成 ---"
+          echo "--- OpenVPN 连接步骤完成 ---"
 
+      # --- 原有的下载并运行脚本步骤 ---
       - name: 下载并运行脚本
         # 如果 Job 环境配置正确，此步骤现在应该会通过 VPN 隧道访问网络。
         run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
 
+      # --- 原有的循环检查网络连接步骤 ---
       - name: 循环检查网络连接和状态
         # 此处的网络检查现在会通过 VPN 进行。如果脚本需要访问的是 VPN 内网资源，
         # 请修改这里的 curl 检查目标为 VPN 内网中的某个已知 IP 或域名。
@@ -231,7 +143,7 @@ jobs:
             BAIDU_STATUS=""
 
             # 考虑检查一个 VPN 内网 IP 来代替外部网站，如果目标是验证到内网的连通性
-            # For example: INTERNAL_IP="192.168.1.1" # 替换为实际的内网 IP
+            # For example: INTERNAL_IP="196.168.1.1" # 替换为实际的内网 IP
             # if ping -c 3 $INTERNAL_IP > /dev/null 2>&1; then
             #   echo "√ Internal IP $INTERNAL_IP reachable via VPN."
             # else
