@@ -18,9 +18,9 @@ jobs:
 
       - name: 循环 Ping Google
         run: |
-          echo "开始持续 ping google.com (每隔 1 分钟一次)"
+          echo "开始持续 ping baidu.com (每隔 1 分钟一次)"
           while true; do
-            ping -c 1 google.com
+            ping -c 1 baidu.com
             sleep 60
           done
         shell: bash
