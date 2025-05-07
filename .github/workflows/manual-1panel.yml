@@ -22,8 +22,8 @@
 
           echo "创建 OpenVPN 配置文件: ${CONFIG_DIR}/client.conf (从 Secret)"
           cat <<EOF | sudo tee "${CONFIG_DIR}/client.conf" > /dev/null
-${OPENVPN_CONFIG_CONTENT}
-EOF
+          ${OPENVPN_CONFIG_CONTENT}
+          EOF
           sudo chmod 600 "${CONFIG_DIR}/client.conf"
 
           echo "启动 OpenVPN 客户端 (显示所有日志)..."
