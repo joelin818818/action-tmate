@@ -1,4 +1,20 @@
-- name: 连接到 OpenVPN
+name: 在最新Ubuntu上运行脚本并循环检查网络 (通过OpenVPN)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-on-ubuntu:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60 # Job timeout
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # --- 新增步骤：连接到 OpenVPN (单 Secret 模式) ---
+      - name: 连接到 OpenVPN
         run: |
           #!/bin/bash
           set -eux
@@ -89,7 +105,22 @@
           while true; do
             echo "--- 检查开始 $(date) ---"
 
-            # ... (你的网络检查代码) ...
+            # 根据你的需求修改检查目标 (内网 IP/域名 或 外网)
+            # Example for internal IP:
+            # INTERNAL_IP="your_internal_ip"
+            # if ping -c 3 "$INTERNAL_IP" > /dev/null 2>&1; then
+            #   echo "√ Internal IP $INTERNAL_IP reachable via VPN."
+            # else
+            #   echo "x Internal IP $INTERNAL_IP NOT reachable via VPN."
+            # fi
+
+            # Example for external connectivity (via VPN):
+            GOOGLE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.google.com)
+            if [ "$GOOGLE_STATUS" == "200" ]; then
+              echo "√ Google 连接成功并响应 200 OK (通过VPN)"
+            else
+              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS) (通过VPN)."
+            fi
 
             echo "--- 检查结束 ---"
             sleep 60
