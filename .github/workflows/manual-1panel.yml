@@ -12,114 +12,175 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # --- 步骤调整：此步骤现在在连接 VPN 之前运行 ---
-      - name: 下载并运行脚本
-        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
-        # 注意: 此脚本将使用机器的直接网络连接，在 VPN 建立之前执行。
-
-      # --- 步骤调整：连接到 OpenVPN 现在是后续步骤 ---
-      - name: 连接到 OpenVPN
+      # --- 新增的合并步骤：并发连接OpenVPN并运行脚本 ---
+      - name: 并发：连接OpenVPN并运行脚本
         run: |
           #!/bin/bash
-          set -eux # -e: exit on error, -u: unset variables are errors, -x: print commands
+          # 主脚本层面不使用 set -e，以便手动处理后台任务的成功/失败
+          # set -u # 可选，如果需要检查未定义变量
+          # set -x # 可选，但并发时日志会非常混乱
 
-          echo "--- 开始连接 OpenVPN ---"
+          # --- OpenVPN 连接与验证函数 (基于您提供的脚本) ---
+          connect_vpn_and_verify() {
+            # 在此函数 (子shell) 内部启用 set -eux
+            set -eux
+            echo "--- [VPN任务] 开始连接 OpenVPN ---"
+            OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
+            CONFIG_DIR="/etc/openvpn/client"
+            CONFIG_FILE="${CONFIG_DIR}/client.conf"
+            PID_FILE="/tmp/openvpn.pid"
 
-          OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
-          CONFIG_DIR="/etc/openvpn/client"
-          CONFIG_FILE="${CONFIG_DIR}/client.conf"
-          PID_FILE="/tmp/openvpn.pid"
-
-          echo "安装 OpenVPN 软件包..."
-          if ! dpkg -s openvpn > /dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y openvpn
-          else
-            echo "OpenVPN 软件包已安装."
-          fi
-
-          echo "创建配置目录: ${CONFIG_DIR}"
-          sudo mkdir -p "${CONFIG_DIR}"
-          sudo chmod 700 "${CONFIG_DIR}"
-
-          echo "创建 OpenVPN 配置文件: ${CONFIG_FILE} (从 Secret)"
-          echo "${OPENVPN_CONFIG_CONTENT}" | sudo sh -c "cat > ${CONFIG_FILE}"
-          sudo chmod 600 "${CONFIG_FILE}"
-
-          echo "启动 OpenVPN 客户端 (后台运行，显示所有日志)..."
-          sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" &
-
-          echo "等待 OpenVPN 初始化 (5 秒)..."
-          sleep 5
-
-          echo "验证 OpenVPN 连接..."
-          TIMEOUT_SECONDS=90
-          VPN_IFACE="tun0" # 关键: 确认您的 VPN 接口名称
-          # DETECTED_IFACE=$(ip -o link show | awk -F': ' '/tun[0-9]+/ {print $2; exit}')
-          # if [ -z "$DETECTED_IFACE" ]; then
-          #   echo "✗ 错误：未找到 tun 接口。"
-          #   if [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null; then sudo kill "$(cat ${PID_FILE})"; fi
-          #   exit 1
-          # fi
-          # VPN_IFACE="$DETECTED_IFACE"
-          # echo "检测到并使用 VPN 接口: ${VPN_IFACE}"
-
-          END_TIME=$((SECONDS + TIMEOUT_SECONDS))
-
-          while [ $SECONDS -lt $END_TIME ]; do
-            echo "检查 ${VPN_IFACE} 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
-            if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet "; then
-              echo "✓ ${VPN_IFACE} 接口找到并已分配 IP 地址!"
-              DEFAULT_ROUTE=$(ip route show default)
-              if echo "$DEFAULT_ROUTE" | grep -q "${VPN_IFACE}"; then
-                echo "✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
-                echo "=== IP Addr (${VPN_IFACE}) ==="
-                ip addr show "${VPN_IFACE}"
-                echo "=== Route Table (Default) ==="
-                ip route show default
-                echo "--- OpenVPN 连接步骤完成 ---"
-                exit 0
-              else
-                echo "✗ ${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。当前默认路由:"
-                echo "${DEFAULT_ROUTE}"
-                echo "完整路由表:"
-                ip route show
-              fi
+            echo "[VPN任务] 安装 OpenVPN 软件包..."
+            if ! dpkg -s openvpn > /dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y openvpn
             else
-              echo "等待 ${VPN_IFACE} 接口出现并获取 IP 地址..."
+              echo "[VPN任务] OpenVPN 软件包已安装."
             fi
 
-            if ! ( [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null ); then
-                echo "✗ OpenVPN 进程 (PID 文件: ${PID_FILE}) 似乎已意外退出。"
-                exit 1
-            fi
-            sleep 10
-          done
+            echo "[VPN任务] 创建配置目录: ${CONFIG_DIR}"
+            sudo mkdir -p "${CONFIG_DIR}"
+            sudo chmod 700 "${CONFIG_DIR}"
 
-          echo "✗ OpenVPN 连接超时或未建立默认路由（${TIMEOUT_SECONDS}秒内）。"
-          echo "=== Route Table ==="
-          ip route show
-          echo "=== IP Addr ==="
-          ip addr show
-          echo "=== All Interfaces ==="
-          ip link show
-          echo "==================="
-          if [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null; then
-            echo "尝试停止 OpenVPN 进程 (PID: $(cat ${PID_FILE}))..."
-            sudo kill "$(cat ${PID_FILE})" || echo "警告：无法停止 OpenVPN 进程，可能已退出。"
+            echo "[VPN任务] 创建 OpenVPN 配置文件: ${CONFIG_FILE} (从 Secret)"
+            echo "${OPENVPN_CONFIG_CONTENT}" | sudo sh -c "cat > ${CONFIG_FILE}"
+            sudo chmod 600 "${CONFIG_FILE}"
+
+            echo "[VPN任务] 启动 OpenVPN 客户端 (后台运行)..."
+            # OpenVPN 客户端本身作为守护进程运行，但这里的 '&' 是为了让此 openvpn 命令不阻塞父脚本
+            # 注意: sudo openvpn 命令本身会fork一个守护进程，这里的 '&' 作用于 sudo 命令的启动
+            # 我们依然依赖 --writepid 和后续的 ps 检查来确认 OpenVPN 守护进程的状态
+            sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" &
+
+            echo "[VPN任务] 等待 OpenVPN 初始化 (5 秒)..."
+            sleep 5
+
+            echo "[VPN任务] 验证 OpenVPN 连接..."
+            TIMEOUT_SECONDS=90
+            VPN_IFACE="tun0" # 关键: 确认您的 VPN 接口名称
+
+            END_TIME=$((SECONDS + TIMEOUT_SECONDS))
+            while [ $SECONDS -lt $END_TIME ]; do
+              echo "[VPN任务] 检查 ${VPN_IFACE} 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
+              if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet "; then
+                DEFAULT_ROUTE=$(ip route show default)
+                if echo "$DEFAULT_ROUTE" | grep -q "${VPN_IFACE}"; then
+                  echo "[VPN任务] ✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
+                  echo "[VPN任务] === IP Addr (${VPN_IFACE}) ==="
+                  ip addr show "${VPN_IFACE}"
+                  echo "[VPN任务] === Route Table (Default) ==="
+                  ip route show default
+                  echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
+                  exit 0 # 表示此函数成功
+                else
+                  echo "[VPN任务] ✗ ${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。"
+                fi
+              else
+                echo "[VPN任务] 等待 ${VPN_IFACE} 接口出现并获取 IP 地址..."
+              fi
+
+              # 检查 OpenVPN 守护进程是否仍在运行 (通过PID文件)
+              if ! ( [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null ); then
+                echo "[VPN任务] ✗ OpenVPN 进程 (PID 文件: ${PID_FILE}) 似乎已意外退出。"
+                exit 1 # 表示此函数失败
+              fi
+              sleep 10
+            done
+
+            echo "[VPN任务] ✗ OpenVPN 连接超时或未建立默认路由（${TIMEOUT_SECONDS}秒内）。"
+            # 清理 (如果OpenVPN进程仍在运行)
+            if [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null; then
+              echo "[VPN任务] 尝试停止 OpenVPN 进程 (PID: $(cat ${PID_FILE}))..."
+              sudo kill "$(cat ${PID_FILE})" || echo "[VPN任务] 警告：无法停止 OpenVPN 进程。"
+            fi
+            exit 1 # 表示此函数失败
+          }
+
+          # --- 下载并运行脚本函数 ---
+          download_and_run_script() {
+            # 在此函数 (子shell) 内部启用 set -eux
+            set -eux
+            echo "--- [脚本任务] 开始下载并运行 quick_start.sh ---"
+            # 如果 quick_start.sh 依赖 VPN，它可能会在 VPN 完全就绪前尝试执行网络操作
+            # 因此，quick_start.sh 自身需要有足够的鲁棒性或等待逻辑（如果它强依赖VPN）
+            curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
+            sudo bash quick_start.sh
+            echo "[脚本任务] ✓ quick_start.sh 执行完毕。"
+            # 假设 quick_start.sh 成功执行则此函数成功
+            exit 0
+          }
+
+          # --- 主执行逻辑：启动并发任务并等待 ---
+          echo "启动 VPN 连接任务和脚本执行任务..."
+
+          connect_vpn_and_verify &
+          VPN_TASK_PID=$! # 获取后台VPN任务的PID
+
+          download_and_run_script &
+          SCRIPT_TASK_PID=$! # 获取后台脚本任务的PID
+
+          echo "VPN 任务 PID: ${VPN_TASK_PID}"
+          echo "脚本任务 PID: ${SCRIPT_TASK_PID}"
+          echo "等待所有后台任务完成..."
+
+          VPN_TASK_SUCCESS=false
+          SCRIPT_TASK_SUCCESS=false
+
+          # 等待 VPN 任务
+          if wait $VPN_TASK_PID; then
+            echo "✓ VPN 连接任务成功完成。"
+            VPN_TASK_SUCCESS=true
           else
-            echo "OpenVPN 进程未运行或 PID 文件 (${PID_FILE}) 未找到。"
+            echo "✗ VPN 连接任务失败 (退出码: $?)"
           fi
-          exit 1
+
+          # 等待脚本任务
+          if wait $SCRIPT_TASK_PID; then
+            echo "✓ 下载并运行脚本任务成功完成。"
+            SCRIPT_TASK_SUCCESS=true
+          else
+            echo "✗ 下载并运行脚本任务失败 (退出码: $?)"
+          fi
+
+          # 检查总体结果
+          if $VPN_TASK_SUCCESS && $SCRIPT_TASK_SUCCESS; then
+            echo "✓✓ 所有并发任务均成功完成。"
+            exit 0 # 整个合并步骤成功
+          else
+            echo "✗✗ 一个或多个并发任务失败。VPN任务成功: $VPN_TASK_SUCCESS, 脚本任务成功: $SCRIPT_TASK_SUCCESS."
+            # 如果需要，可以在这里添加额外的清理逻辑
+            exit 1 # 整个合并步骤失败
+          fi
         shell: bash
 
-      # --- 此步骤现在在 VPN 连接之后运行 ---
+      # --- 原有的循环检查网络连接步骤 ---
+      # 此步骤将在上述并发步骤成功完成后执行
       - name: 循环检查网络连接和状态
         run: |
           #!/bin/bash
           set -e 
 
           echo "开始持续检查网络连接 (每隔 1 分钟一次)"
+
+          # 在开始正式循环前，可以给一点额外时间或做一个快速的 VPN 状态确认
+          echo "等待30秒，确保网络环境稳定..."
+          sleep 30
+          
+          VPN_IFACE="tun0" # 再次确认接口，或从前一阶段传递状态
+          IS_VPN_REALLY_UP=false
+          if ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet " && ip route show default | grep -q "${VPN_IFACE}"; then
+            echo "✓ VPN 接口 (${VPN_IFACE}) 在循环检查前确认可用。"
+            IS_VPN_REALLY_UP=true
+          else
+            echo "⚠ 警告: VPN 接口 (${VPN_IFACE}) 在循环检查前似乎未完全就绪。将继续尝试..."
+            echo "当前默认路由:"
+            ip route show default || echo "无法获取默认路由"
+            echo "当前 ${VPN_IFACE} 状态:"
+            ip addr show "${VPN_IFACE}" || echo "${VPN_IFACE} 接口不存在"
+          fi
+
+          # 如果上一步的并发任务确认 VPN 必须成功，这里的检查更多是辅助性的。
+          # 如果并发任务中 VPN 失败会导致整个 Job 失败，那么到这里时 VPN 应该是好的。
 
           while true; do
             echo "--- 网络检查开始 $(date) ---"
