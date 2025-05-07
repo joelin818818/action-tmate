@@ -1,4 +1,4 @@
-name: 在最新Ubuntu上运行脚本并循环Ping
+name: 在最新Ubuntu上运行脚本并循环检查网络
 
 on:
   workflow_dispatch:
@@ -16,11 +16,37 @@ jobs:
       - name: 下载并运行脚本
         run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
 
-      - name: 循环 Ping Google
+      - name: 循环检查网络连接和状态
         run: |
-          echo "开始持续 ping 10.1.0.116 (每隔 1 分钟一次)"
+          #!/bin/bash
+
+          echo "开始持续检查网络连接 (每隔 1 分钟一次)"
+
           while true; do
-            ping -c 1 10.1.0.116
+            echo "--- 检查开始 $(date) ---"
+
+            GOOGLE_STATUS=""
+            BAIDU_STATUS=""
+
+            GOOGLE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.google.com)
+
+            if [ "$GOOGLE_STATUS" == "200" ]; then
+              echo "√ Google 连接成功并响应 200 OK"
+            else
+              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS)。尝试检查 Baidu..."
+              
+              BAIDU_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.baidu.com)
+
+              if [ "$BAIDU_STATUS" == "200" ]; then
+                echo "√ Baidu 连接成功并响应 200 OK"
+              else
+                echo "x Baidu 连接失败或非 200 响应 (状态码: $BAIDU_STATUS)"
+              fi
+            fi
+
+            echo "--- 检查结束 ---"
+
             sleep 60
+
           done
         shell: bash
