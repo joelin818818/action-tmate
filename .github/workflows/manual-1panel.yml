@@ -15,12 +15,13 @@ jobs:
 
       # --- Step 2: 启动 OpenVPN 守护进程并固定等待 ---
       # OpenVPN 进程需要在此步骤启动并保持运行，以便后续步骤使用
+      # 步骤会按顺序执行
       - name: 启动OpenVPN守护进程并等待固定时间 # 步骤名称
-        id: setup-vpn # 给此步骤一个ID，供后续步骤引用
+        id: setup-vpn # 给此步骤一个ID (虽然在这里不需要 needs 引用，但保留方便将来改动)
         run: | # 在Ubuntu运行器上执行Shell脚本
           #!/bin/bash
           # 遇到错误或使用未定义变量时立即退出，除非特别处理
-          set -eu 
+          set -eu
 
           # OpenVPN 守护进程的 PID 文件路径
           local PID_FILE="/tmp/openvpn_daemon.pid"
@@ -88,10 +89,10 @@ jobs:
         shell: bash # 使用 bash 执行脚本
 
       # --- Step 3: 运行 quick_start.sh 脚本 ---
-      # 此步骤依赖于上一步成功
+      # 此步骤将在上一步成功后自动运行
       - name: 运行 quick_start.sh 脚本 # 步骤名称
-        id: run-script # 给此步骤一个ID
-        needs: setup-vpn # 依赖 'setup-vpn' 步骤成功
+        id: run-script # 给此步骤一个ID (保留方便将来改动)
+        # 删除 'needs: setup-vpn' 这一行
         run: | # 在Ubuntu运行器上执行Shell脚本
           #!/bin/bash
           # 遇到错误、使用未定义变量时立即退出，并打印执行的命令
@@ -109,14 +110,14 @@ jobs:
           echo "[Script Task] 执行 quick_start.sh..."
           sudo bash quick_start.sh # 执行脚本
 
-          echo "[Script Task] ✓ quick_start.sh 执行完毕。"
+          echo "[Script Task] ✓ quick_start.sh execution complete."
           # set -eux 会确保如果 sudo bash 执行失败，此脚本会以非零退出码退出
         shell: bash # 使用 bash 执行脚本
 
       # --- Step 4: 循环检查外部网络 ---
-      # 此步骤依赖于 Step 3 成功，并会持续运行直到作业超时或检查失败
+      # 此步骤将在 Step 3 成功后自动运行，并会持续运行直到作业超时或检查失败
       - name: 循环检查外部网络 # 步骤名称
-        needs: run-script # 依赖 'run-script' 步骤成功
+        # 删除 'needs: run-script' 这一行
         run: | # 在Ubuntu运行器上执行Shell脚本
           # 在此脚本中启用 set -e，遇到错误（如 curl --fail 失败）立即退出
           set -e
@@ -163,7 +164,7 @@ jobs:
             else
               # curl 失败时的日志信息
               local STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
-              echo "[Network Check] ✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE})。本任务将退出。"
+              echo "[Network Check] ✗ ${TARGET_URL} 连接失败或异常响应 (状态码: ${STATUS_CODE})。本任务将退出。"
               exit 1 # 显式退出，触发 set -e 和 trap
             fi
             echo "[Network Check] --- 外部检查结束 $(date) ---"
