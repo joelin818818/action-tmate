@@ -1,4 +1,4 @@
-name: 在最新Ubuntu上运行脚本并循环检查网络
+name: 在最新Ubuntu上运行脚本并循环检查网络 (通过VPN) # Updated name
 
 on:
   workflow_dispatch:
@@ -7,40 +7,240 @@ jobs:
   run-on-ubuntu:
     runs-on: ubuntu-latest
 
-    timeout-minutes: 60
+    timeout-minutes: 60 # Job timeout
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 下载并运行脚本
-        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
-
-      - name: 循环检查网络连接和状态
+      # --- 新增步骤：连接到 L2TP/IPsec VPN ---
+      - name: 连接到 L2TP/IPsec VPN
         run: |
           #!/bin/bash
+          set -eux # Exit immediately if a command exits with a non-zero status. Print commands as they are executed.
 
+          # Fetch VPN Server IP from secrets
+          VPN_SERVER_IP="${{ secrets.VPN_IP }}" # **修改点：** 从 secrets 获取 VPN 服务器 IP
+          echo "--- 开始连接 L2TP/IPsec VPN ---"
+          echo "VPN Server: ${VPN_SERVER_IP}"
+          # Security warning: Do not echo secrets!
+
+          # 1. 安装必要的软件包
+          echo "安装 VPN 软件包 (strongswan, xl2tpd)..."
+          if ! dpkg -s strongswan xl2tpd > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y strongswan xl2tpd
+          else
+            echo "所需的 VPN 软件包已安装."
+          fi
+
+          # 2. 停止服务 (如果正在运行)
+          echo "停止可能冲突的服务..."
+          sudo systemctl stop strongswan || true
+          sudo systemctl stop xl2tpd || true
+          sleep 2 # Give services a moment to stop
+
+          # 3. 配置 IPsec (strongswan)
+          echo "配置 IPsec (/etc/ipsec.conf, /etc/ipsec.secrets)..."
+          sudo tee /etc/ipsec.conf > /dev/null <<EOF
+          config setup
+            charondebug="ike 1, cfg 1, net 1, esp 1, dmp 1" # Adjust debug levels as needed
+            uniqueidentity=no # Important for some setups
+            strictcrlpolicy=no # May need adjustment based on server config
+
+          conn myvpn
+            keyexchange=ikev1
+            ikelifetime=60m
+            keylife=20m
+            rekeymargin=3m
+            keyingtries=1
+            authby=secret
+            left=%any
+            leftsourceip=%config
+            leftfirewall=yes
+            right=${VPN_SERVER_IP} # **使用变量：** VPN Server IP
+            rightsubnet=0.0.0.0/0 # Expect to route all traffic over VPN
+            type=transport
+            auto=add # Load connection definition at startup
+EOF
+
+          # 创建 ipsec.secrets
+          # 使用 secrets 安全地注入 PSK
+          # **使用变量：** VPN Server IP
+          echo "%any ${VPN_SERVER_IP} : PSK \"${{ secrets.VPN_PSK }}\"" | sudo tee /etc/ipsec.secrets > /dev/null
+          sudo chmod 600 /etc/ipsec.secrets # Set strict permissions
+
+          # 4. 配置 L2TP (xl2tpd) 和 PPP
+          echo "配置 L2TP (/etc/xl2tpd/xl2tpd.conf) 和 PPP (/etc/ppp/options.l2tpd.client)..."
+          sudo tee /etc/xl2tpd/xl2tpd.conf > /dev/null <<EOF
+          [global]
+          # port = 1701 # Default
+
+          [lac myvpn_connection]
+          lns = ${VPN_SERVER_IP} # **使用变量：** VPN Server IP
+          ppp debug = yes
+          pppoptfile = /etc/ppp/options.l2tpd.client
+          require authentication = yes
+EOF
+
+          # 创建 PPP options 文件 for L2TP client
+          # 使用 secrets 安全地注入用户名和密码
+          sudo tee /etc/ppp/options.l2tpd.client > /dev/null <<EOF
+          # Authentication
+          name "${{ secrets.VPN_USERNAME }}"
+          password "${{ secrets.VPN_PASSWORD }}"
+
+          # Common options
+          unit 0 # Assign to ppp0
+          require-mschap-v2 # Common for Windows L2TP/IPsec servers
+
+          # DNS - Important for routing traffic through VPN if internal DNS is used
+          usepeerdns # Try to get DNS from VPN server
+          # If usepeerdns doesn't work, uncomment and set manually:
+          # ms-dns 192.168.1.254 # From image
+          # ms-dns 42.240.136.88 # From image
+
+          # IP configuration
+          defaultroute # Add default route through this connection (Crucial for routing traffic!)
+
+          # Other options
+          lock
+          debug # Enable PPP debug logging
+
+          # LCP echo
+          lcp-echo-interval 30
+          lcp-echo-failure 5
+
+          # MTU/MRU - Use values from image (1400) if needed, otherwise default is usually ok
+          # mtu 1400
+          # mru 1400
+
+          persist # Keep trying to connect
+          maxfail 10 # Try connecting up to 10 times
+EOF
+          sudo chmod 600 /etc/ppp/options.l2tpd.client # Set strict permissions
+
+          # 5. 启动服务
+          echo "启动 IPsec 和 xl2tpd 服务..."
+          sudo systemctl daemon-reload
+          sudo systemctl start strongswan
+          sudo systemctl start xl2tpd
+
+          # Give services time to initialize
+          sleep 5
+
+          # Ensure IPsec is loaded and seems OK
+          echo "检查 IPsec 状态..."
+          # Check ipsec status output for common issues
+          sudo ipsec status || {
+              echo "IPsec 服务启动或配置有问题. IPsec status:"
+              sudo ipsec status # Print status on failure
+              exit 1
+          }
+          echo "IPsec 服务状态良好."
+
+
+          # 6. 发起 VPN 连接
+          echo "发起 VPN 连接 'myvpn_connection'..."
+          echo "c myvpn_connection" | sudo tee /var/run/xl2tpd/l2tp-control > /dev/null
+
+          # 7. 验证连接 (关键步骤!)
+          echo "等待并验证 VPN 连接 (ppp0 接口)..."
+          timeout=90 # Increased timeout for VPN connection attempt
+          while [ $timeout -gt 0 ]; do
+            if ip addr show ppp0 > /dev/null 2>&1; then
+              echo "VPN ppp0 接口找到!"
+              # Verify default route goes through ppp0
+              if ip route show default | grep "ppp0" > /dev/null; then
+                 echo "✓ VPN 连接成功，默认路由通过 ppp0."
+                 ip addr show ppp0 # Show assigned IP
+                 ip route show # Show routing table
+                 # Optional: Ping an internal IP if known to confirm routing
+                 # Replace <internal_vpn_ip> with an actual IP inside the VPN network you can ping
+                 # Example: ping -c 3 192.168.230.1 && echo "Internal ping successful." || echo "Internal ping failed."
+                 break # Exit the loop if connected
+              else
+                 echo "ppp0 接口已存在，但默认路由未通过 VPN。可能连接未完全建立或配置问题。"
+                 ip route show
+              fi
+            else
+              echo "等待 ppp0 接口... 剩余 $timeout 秒"
+            fi
+
+            sleep 10 # Wait 10 seconds between checks
+            timeout=$((timeout - 10))
+          done
+
+          # Final check and exit if connection failed
+          if ! ip addr show ppp0 > /dev/null 2>&1 || ! ip route show default | grep "ppp0" > /dev/null; then
+            echo "✗ VPN 连接失败或未建立默认路由。"
+            # Print logs for debugging
+            echo "=== IPsec Logs ==="
+            # Get logs from charon and strongswan services
+            sudo journalctl -u strongswan -u charon --since "last boot" --no-pager -o cat || true
+            echo "=== xl2tpd Logs ==="
+             # Get logs from xl2tpd service
+            sudo journalctl -u xl2tpd --since "last boot" --no-pager -o cat || true
+            echo "=== pppd Logs (from syslog/daemon.log) ==="
+            # pppd logs often go to syslog or daemon.log
+            sudo grep pppd /var/log/syslog --since "last boot" -n 100 || true
+            sudo grep pppd /var/log/daemon.log --since "last boot" -n 100 || true
+
+            echo "=== Route Table ==="
+            ip route show
+            echo "=== IP Addr ==="
+            ip addr show
+            echo "==================="
+            exit 1 # Fail the job
+          fi
+
+          echo "--- L2TP/IPsec VPN 连接步骤完成 ---"
+
+      # --- 原有的下载并运行脚本步骤 ---
+      - name: 下载并运行脚本
+        # 如果 Job 环境配置正确，此步骤现在应该会通过 VPN 隧道访问网络。
+        run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
+
+      # --- 原有的循环检查网络连接步骤 ---
+      - name: 循环检查网络连接和状态
+        # 此处的网络检查现在会通过 VPN 进行。如果脚本需要访问的是 VPN 内网资源，
+        # 可以修改这里的 curl 检查目标为 VPN 内网中的某个已知 IP 或域名。
+        run: |
+          #!/bin/bash
+          # ... (之前的循环检查脚本，现在会在 VPN 内网环境下运行) ...
           echo "开始持续检查网络连接 (每隔 1 分钟一次)"
 
           while true; do
             echo "--- 检查开始 $(date) ---"
 
+            # 这里的检查目标需要根据 VPN 内网资源调整
+            # 如果是检查外网连通性，保持 google/baidu 检查也可以
             GOOGLE_STATUS=""
             BAIDU_STATUS=""
 
+            # Consider checking an internal VPN IP here instead of external sites if the goal
+            # is to verify VPN connectivity to the internal network.
+            # For example: INTERNAL_IP="192.168.1.1" # Replace with an actual internal IP
+            # if ping -c 3 $INTERNAL_IP > /dev/null 2>&1; then
+            #   echo "√ Internal IP $INTERNAL_IP reachable via VPN."
+            # else
+            #   echo "x Internal IP $INTERNAL_IP NOT reachable via VPN."
+            # fi
+
+            # Keep external checks if needed, but understand they go through VPN
             GOOGLE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.google.com)
 
             if [ "$GOOGLE_STATUS" == "200" ]; then
-              echo "√ Google 连接成功并响应 200 OK"
+              echo "√ Google 连接成功并响应 200 OK (通过VPN)"
             else
-              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS)。尝试检查 Baidu..."
-              
+              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS) (通过VPN)。尝试检查 Baidu..."
+
               BAIDU_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.baidu.com)
 
               if [ "$BAIDU_STATUS" == "200" ]; then
-                echo "√ Baidu 连接成功并响应 200 OK"
+                echo "√ Baidu 连接成功并响应 200 OK (通过VPN)"
               else
-                echo "x Baidu 连接失败或非 200 响应 (状态码: $BAIDU_STATUS)"
+                echo "x Baidu 连接失败或非 200 响应 (状态码: $BAIDU_STATUS) (通过VPN)"
               fi
             fi
 
