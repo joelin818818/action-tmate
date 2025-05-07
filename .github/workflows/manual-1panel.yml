@@ -17,17 +17,14 @@ jobs:
       - name: 连接到 OpenVPN
         run: |
           #!/bin/bash
-          set -eux # 遇到错误立即退出，打印执行的命令
+          set -eux
 
           echo "--- 开始连接 OpenVPN ---"
 
-          # 从 secrets 获取完整的 OpenVPN 配置内容
-          # 安全警告：请勿在这里或 Job 日志中直接 echo secrets 的值！
           OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
+          CONFIG_DIR="/etc/openvpn/client"
 
-          # 1. 安装 OpenVPN 软件包
           echo "安装 OpenVPN 软件包..."
-          # 检查软件包是否已安装，避免重复安装和更新
           if ! dpkg -s openvpn > /dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y openvpn
@@ -35,28 +32,19 @@ jobs:
             echo "OpenVPN 软件包已安装."
           fi
 
-          # 2. 创建配置目录和文件
-          CONFIG_DIR="/etc/openvpn/client"
           echo "创建配置目录: ${CONFIG_DIR}"
           sudo mkdir -p "${CONFIG_DIR}"
-          sudo chmod 700 "${CONFIG_DIR}" # 限制权限
+          sudo chmod 700 "${CONFIG_DIR}"
 
           echo "创建 OpenVPN 配置文件: ${CONFIG_DIR}/client.conf (从 Secret)"
-          # 将完整的 .ovpn 文件内容 (从 Secret 获取) 写入 client.conf
-          # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进必须完全一致 (例如，都顶格或都使用相同的空格数)
           cat <<EOF | sudo tee "${CONFIG_DIR}/client.conf" > /dev/null
           ${OPENVPN_CONFIG_CONTENT}
           EOF
-          sudo chmod 600 "${CONFIG_DIR}/client.conf" # 设置严格权限
+          sudo chmod 600 "${CONFIG_DIR}/client.conf"
 
-          # 3. 启动 OpenVPN 客户端
           echo "启动 OpenVPN 客户端..."
-          # 使用 --config 指向创建的配置文件
-          # 使用 --daemon 在后台运行，并将日志和 PID 写入文件
-          # 使用 || { ...; exit 1; } 结构捕获启动失败并退出 Job
           sudo openvpn --config "${CONFIG_DIR}/client.conf" --daemon --log "${CONFIG_DIR}/openvpn.log" --writepid /tmp/openvpn.pid || {
             echo "✗ OpenVPN 客户端启动失败."
-            # 打印日志以帮助调试
             if [ -f "${CONFIG_DIR}/openvpn.log" ]; then
               echo "=== OpenVPN Logs ==="
               cat "${CONFIG_DIR}/openvpn.log"
@@ -64,44 +52,36 @@ jobs:
             exit 1
           }
 
-          # 给 OpenVPN 一点时间建立连接
-          echo "等待 OpenVPN 连接建立..."
-          sleep 10
+          echo "等待 OpenVPN 连接建立 (更长时间)..."
+          sleep 20 # 增加等待时间
 
-          # 4. 验证连接 (关键步骤!)
           echo "验证 OpenVPN 连接..."
-          TIMEOUT=60 # 等待连接的最长时间
-          VPN_IFACE="tun0" # OpenVPN 使用 dev tun 通常会在 Linux 创建 tun0 接口
+          TIMEOUT=60
+          VPN_IFACE="tunx" # 确保使用 tunx
 
           while [ "$TIMEOUT" -gt 0 ]; do
-            # 检查 VPN 接口 (tun0) 是否存在且已获得 IP 地址
             if ip addr show "${VPN_IFACE}" > /dev/null 2>&1 && ip addr show "${VPN_IFACE}" | grep "inet " > /dev/null; then
               echo "${VPN_IFACE} 接口找到并已分配 IP 地址!"
-              # 检查默认路由是否通过 VPN 接口
-              if ip route show default | grep "${VPN_IFACE}" > /dev/null; then
+              # 更可靠地检查默认路由是否通过 VPN 接口
+              DEFAULT_ROUTE=$(ip route show default)
+              if echo "$DEFAULT_ROUTE" | grep "${VPN_IFACE}"; then
                 echo "✓ VPN 连接成功，默认路由通过 ${VPN_IFACE}."
-                ip addr show "${VPN_IFACE}" # 显示分配的 IP 地址
-                ip route show # 显示路由表
-                # 可选：ping 一个已知的 VPN 内网 IP 地址来确认路由是否工作
-                # 替换 <internal_vpn_ip> 为您 VPN 内网中一个确定可以 ping 通的 IP
-                # Example: ping -c 3 196.168.230.1 && echo "Internal ping successful." || echo "Internal ping failed."
-                break # 如果连接成功且路由正确，退出等待循环
+                ip addr show "${VPN_IFACE}"
+                ip route show
+                break
               else
-                echo "${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN。可能连接未完全建立或配置问题。"
+                echo "${VPN_IFACE} 接口存在并有 IP，但默认路由未通过 VPN:"
                 ip route show
               fi
             else
               echo "等待 ${VPN_IFACE} 接口并获取 IP 地址... 剩余 ${TIMEOUT} 秒"
             fi
-
-            sleep 10 # 每 10 秒检查一次
+            sleep 10
             TIMEOUT=$((TIMEOUT - 10))
           done
 
-          # 最终检查，如果连接失败则失败 Job
-          if ! ip addr show "${VPN_IFACE}" > /dev/null 2>&1 || ! ip route show default | grep "${VPN_IFACE}" > /dev/null; then
+          if ! ip addr show "${VPN_IFACE}" > /dev/null 2>&1 || ! ip route show default | grep "${VPN_IFACE}"; then
             echo "✗ OpenVPN 连接失败或未建立默认路由。"
-            # 打印日志以帮助调试
             if [ -f "${CONFIG_DIR}/openvpn.log" ]; then
               echo "=== OpenVPN Logs ==="
               cat "${CONFIG_DIR}/openvpn.log"
@@ -111,24 +91,20 @@ jobs:
             echo "=== IP Addr ==="
             ip addr show
             echo "==================="
-            # 尝试停止 OpenVPN 客户端进程 (如果启动了但连接失败)
             if [ -f "/tmp/openvpn.pid" ]; then
               sudo kill "$(cat /tmp/openvpn.pid)" || true
             fi
-            exit 1 # 失败 Job
+            exit 1
           fi
 
           echo "--- OpenVPN 连接步骤完成 ---"
 
       # --- 原有的下载并运行脚本步骤 ---
       - name: 下载并运行脚本
-        # 如果 Job 环境配置正确，此步骤现在应该会通过 VPN 隧道访问网络。
         run: curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh && sudo bash quick_start.sh
 
       # --- 原有的循环检查网络连接步骤 ---
       - name: 循环检查网络连接和状态
-        # 此处的网络检查现在会通过 VPN 进行。如果脚本需要访问的是 VPN 内网资源，
-        # 请修改这里的 curl 检查目标为 VPN 内网中的某个已知 IP 或域名。
         run: |
           #!/bin/bash
 
@@ -137,40 +113,24 @@ jobs:
           while true; do
             echo "--- 检查开始 $(date) ---"
 
-            # 这里的检查目标需要根据 VPN 内网资源调整
-            # 如果是检查外网连通性，保持 google/baidu 检查也可以
-            GOOGLE_STATUS=""
-            BAIDU_STATUS=""
-
-            # 考虑检查一个 VPN 内网 IP 来代替外部网站，如果目标是验证到内网的连通性
-            # For example: INTERNAL_IP="196.168.1.1" # 替换为实际的内网 IP
+            # 根据你的需求修改检查目标 (内网 IP/域名 或 外网)
+            # Example for internal IP:
+            # INTERNAL_IP="your_internal_ip"
             # if ping -c 3 "$INTERNAL_IP" > /dev/null 2>&1; then
             #   echo "√ Internal IP $INTERNAL_IP reachable via VPN."
             # else
             #   echo "x Internal IP $INTERNAL_IP NOT reachable via VPN."
             # fi
 
-            # 如果需要检查外网连通性，保持 curl 检查外部网站
-            # 请理解这些检查将通过 VPN 进行
+            # Example for external connectivity (via VPN):
             GOOGLE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.google.com)
-
             if [ "$GOOGLE_STATUS" == "200" ]; then
               echo "√ Google 连接成功并响应 200 OK (通过VPN)"
             else
-              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS) (通过VPN)。尝试检查 Baidu..."
-
-              BAIDU_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 -L https://www.baidu.com)
-
-              if [ "$BAIDU_STATUS" == "200" ]; then
-                echo "√ Baidu 连接成功并响应 200 OK (通过VPN)"
-              else
-                echo "x Baidu 连接失败或非 200 响应 (状态码: $BAIDU_STATUS) (通过VPN)"
-              fi
+              echo "x Google 连接失败或非 200 响应 (状态码: $GOOGLE_STATUS) (通过VPN)."
             fi
 
             echo "--- 检查结束 ---"
-
             sleep 60
-
           done
         shell: bash
