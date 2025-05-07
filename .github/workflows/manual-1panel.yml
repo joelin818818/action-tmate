@@ -45,7 +45,7 @@ jobs:
           # 将完整的 .ovpn 文件内容 (从 Secret 获取) 写入 client.conf
           # 注意：这里的 'sudo tee' 命令及其后续 EOF 标记的缩进 (10个空格)
           sudo tee ${CONFIG_DIR}/client.conf > /dev/null <<EOF
-${OPENVPN_CONFIG_CONTENT}
+          ${OPENVPN_CONFIG_CONTENT}
           EOF # <--- 这个 EOF 必须和上面 'sudo tee ${CONFIG_DIR}/client.conf ...' 那行有相同的缩进 (10个空格)
           sudo chmod 600 ${CONFIG_DIR}/client.conf # 设置严格权限
 
