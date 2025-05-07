@@ -102,7 +102,6 @@ jobs:
               # 再次确认进程是否运行
               if [ -n "$daemon_pid" ] && ps -p "$daemon_pid" > /dev/null 2>&1; then
                   echo "[VPN Setup] ✓ OpenVPN 守护进程已确认运行。"
-                  exit 0 # 成功启动
               else
                   echo "[VPN Setup] ✗ OpenVPN 守护进程未能在 ${WAIT_PID_TIMEOUT} 秒内确认运行。启动失败。"
                   exit 1 # 启动失败
@@ -123,7 +122,6 @@ jobs:
               echo "[Script Task] 执行 quick_start.sh..."
               sudo bash quick_start.sh
               echo "[Script Task] ✓ quick_start.sh 执行完毕。"
-              exit 0 # 成功
           }
 
           # --- 循环检查外部网络函数 (保持不变) ---
