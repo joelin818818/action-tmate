@@ -1,217 +1,174 @@
-name: 在最新Ubuntu上运行脚本并循环检查网络 (通过OpenVPN)
+name: 在最新Ubuntu上运行脚本并循环检查网络 (通过OpenVPN) # 工作流名称
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch: # 手动触发此工作流运行
 
 jobs:
-  run-on-ubuntu:
-    runs-on: ubuntu-latest # 使用最新的Ubuntu运行器
-    timeout-minutes: 60 # 作业超时时间，防止无限循环导致作业一直运行
+  run-on-ubuntu: # 作业名称
+    runs-on: ubuntu-latest # 在最新的Ubuntu环境上运行
+    timeout-minutes: 60 # 设置作业超时时间，防止长时间运行
 
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4 # 检出你的代码仓库
+      # Step 1: 检出代码
+      - name: 检出代码 # 步骤名称
+        uses: actions/checkout@v4 # 使用actions/checkout@v4来检出代码仓库
 
-      # --- 主要执行步骤：启动OpenVPN -> 固定等待 -> 运行脚本 -> 循环检测外部网络 ---
-      - name: 启动OpenVPN -> 固定等待 -> 运行脚本 -> 循环检测外部网络 (无连接验证)
-        run: |
+      # --- Step 2: 启动 OpenVPN 守护进程并固定等待 ---
+      # OpenVPN 进程需要在此步骤启动并保持运行，以便后续步骤使用
+      - name: 启动OpenVPN守护进程并等待固定时间 # 步骤名称
+        id: setup-vpn # 给此步骤一个ID，供后续步骤引用
+        run: | # 在Ubuntu运行器上执行Shell脚本
           #!/bin/bash
-          # 在这个主脚本级别不使用 set -e，以便我们可以手动检查函数的退出状态
-          # set -u # 可选，如果需要检查未定义变量
-          # set -x # 可选，用于调试，但输出会非常详细
+          # 遇到错误或使用未定义变量时立即退出，除非特别处理
+          set -eu 
 
-          # --- 全局变量和清理 ---
-          # OpenVPN守护进程的PID文件 (由 --writepid 生成)
-          OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # 更改文件名避免冲突
+          # OpenVPN 守护进程的 PID 文件路径
+          local PID_FILE="/tmp/openvpn_daemon.pid"
 
-          # 清理后台进程的函数
-          # 在这个顺序执行的模型中，只需要清理 OpenVPN 守护进程
-          cleanup_processes() {
-              echo "--- 清理后台进程 ---"
-              # 尝试停止OpenVPN守护进程本身 (通过其PID文件)
+          echo "--- [阶段 1/3] 启动 OpenVPN 守护进程并等待固定时间 ---"
+
+          echo "[VPN Setup] 安装 OpenVPN 软件包..."
+          if ! dpkg -s openvpn > /dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y openvpn
+          else
+            echo "[VPN Setup] OpenVPN 软件包已安装."
+          fi
+
+          local OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}" # 从 Secrets 获取 VPN 配置
+          local CONFIG_DIR="/etc/openvpn/client"
+          local CONFIG_FILE="${CONFIG_DIR}/client.conf"
+
+          echo "[VPN Setup] 创建配置目录: ${CONFIG_DIR}"
+          sudo mkdir -p "${CONFIG_DIR}"
+          sudo chmod 700 "${CONFIG_DIR}" # 设置目录权限
+
+          echo "[VPN Setup] 创建 OpenVPN 配置文件: ${CONFIG_FILE}"
+          echo "${OPENVPN_CONFIG_CONTENT}" | sudo sh -c "cat > ${CONFIG_FILE}"
+          sudo chmod 600 "${CONFIG_FILE}" # 设置文件权限
+
+          echo "[VPN Setup] 使用 nohup 启动 OpenVPN 守护进程 (PID 到 ${PID_FILE})..."
+          # 使用 nohup 和 & 让 OpenVPN 在后台运行，并尝试使其在此步骤结束后继续存在
+          # --writepid 将守护进程的 PID 写入文件
+          # --verb 3 控制 OpenVPN 自身的日志级别
+          # >/dev/null 2>&1 重定向 OpenVPN 日志到空，减少 Actions 日志量
+          nohup sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" --verb 3 >/dev/null 2>&1 &
+          # $! 是 nohup 命令的 PID，不是 OpenVPN 守护进程的 PID
+
+          echo "[VPN Setup] 等待 OpenVPN 守护进程 PID 文件出现并确认进程运行 (最多 20 秒)..."
+          local WAIT_PID_TIMEOUT=20 # 等待 PID 文件和进程出现的时间
+          local END_WAIT_PID=$((SECONDS + WAIT_PID_TIMEOUT))
+          local daemon_pid=""
+
+          # 循环等待 PID 文件和进程
+          while [ $SECONDS -lt $END_WAIT_PID ]; do
+              if [ -f "${PID_FILE}" ] && [ -s "${PID_FILE}" ]; then # 检查文件是否存在且非空
+                   daemon_pid=$(cat "${PID_FILE}")
+                   if ps -p "$daemon_pid" > /dev/null 2>&1; then # 检查 PID 是否对应一个运行的进程
+                       echo "[VPN Setup] OpenVPN 守护进程已启动，PID: $daemon_pid."
+                       break # 找到 PID 且进程运行，跳出循环
+                   fi
+              fi
+              sleep 1 # 每秒检查一次
+          done
+
+          # 检查最终是否确认守护进程运行
+          if [ -n "$daemon_pid" ] && ps -p "$daemon_pid" > /dev/null 2>&1; then
+              echo "[VPN Setup] ✓ OpenVPN 守护进程确认运行。"
+              # --- 固定等待一段时间，给 VPN 连接建立和网络配置时间 ---
+              local FIXED_WAIT_SECONDS=45 # <--- 根据您的 OpenVPN 连接速度和环境调整此值
+              echo "[VPN Setup] 等待 ${FIXED_WAIT_SECONDS} 秒，给 VPN 连接建立和网络配置时间..."
+              sleep ${FIXED_WAIT_SECONDS} # 执行固定等待
+              echo "[VPN Setup] ✓ 固定等待完成。此步骤成功。"
+              exit 0 # 步骤成功退出
+          else
+              echo "[VPN Setup] ✗ OpenVPN 守护进程未能在 ${WAIT_PID_TIMEOUT} 秒内确认运行。启动失败。"
+              exit 1 # 步骤失败退出
+          fi
+        shell: bash # 使用 bash 执行脚本
+
+      # --- Step 3: 运行 quick_start.sh 脚本 ---
+      # 此步骤依赖于上一步成功
+      - name: 运行 quick_start.sh 脚本 # 步骤名称
+        id: run-script # 给此步骤一个ID
+        needs: setup-vpn # 依赖 'setup-vpn' 步骤成功
+        run: | # 在Ubuntu运行器上执行Shell脚本
+          #!/bin/bash
+          # 遇到错误、使用未定义变量时立即退出，并打印执行的命令
+          set -eux
+
+          echo "--- [阶段 2/3] 运行 quick_start.sh 脚本 ---"
+
+          echo "[Script Task] 下载 quick_start.sh 脚本..."
+          curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
+          chmod +x quick_start.sh # 使脚本可执行
+
+          echo "[Script Task] 等待 30 秒后运行 quick_start.sh (脚本自身包含的等待)..."
+          sleep 30 # 脚本执行前的固定等待
+
+          echo "[Script Task] 执行 quick_start.sh..."
+          sudo bash quick_start.sh # 执行脚本
+
+          echo "[Script Task] ✓ quick_start.sh 执行完毕。"
+          # set -eux 会确保如果 sudo bash 执行失败，此脚本会以非零退出码退出
+        shell: bash # 使用 bash 执行脚本
+
+      # --- Step 4: 循环检查外部网络 ---
+      # 此步骤依赖于 Step 3 成功，并会持续运行直到作业超时或检查失败
+      - name: 循环检查外部网络 # 步骤名称
+        needs: run-script # 依赖 'run-script' 步骤成功
+        run: | # 在Ubuntu运行器上执行Shell脚本
+          # 在此脚本中启用 set -e，遇到错误（如 curl --fail 失败）立即退出
+          set -e
+
+          # --- 此步骤的清理函数 ---
+          # 此 trap 确保当本步骤退出时，OpenVPN 守护进程被尝试停止
+          local OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # OpenVPN PID 文件路径
+          cleanup_processes_step3() {
+              echo "--- [阶段 3/3] 清理 OpenVPN 守护进程 ---"
+              # 检查 PID 文件是否存在且进程正在运行
               if [ -f "${OPENVPN_DAEMON_PID_FILE}" ] && ps -p "$(cat ${OPENVPN_DAEMON_PID_FILE} 2>/dev/null)" > /dev/null 2>&1; then
-                  OPENVPN_DAEMON_PID=$(cat ${OPENVPN_DAEMON_PID_FILE})
-                  echo "尝试停止OpenVPN守护进程 (PID: $OPENVPN_DAEMON_PID)..."
-                  # 发送SIGTERM，让OpenVPN优雅退出
-                  sudo kill "$OPENVPN_DAEMON_PID" || true
-                  sleep 2 # 等待几秒让其退出
-                  # 如果进程仍未退出，尝试SIGKILL
-                  if ps -p "$OPENVPN_DAEMON_PID" > /dev/null 2>&1; then
-                      echo "OpenVPN守护进程 (PID: $OPENVPN_DAEMON_PID) 未能正常停止，尝试强制停止 (SIGKILL)..."
-                      sudo kill -9 "$OPENVPN_DAEMON_PID" || true
+                  local daemon_pid=$(cat ${OPENVPN_DAEMON_PID_FILE})
+                  echo "[Cleanup] 尝试停止 OpenVPN 守护进程 (PID: $daemon_pid)..."
+                  sudo kill "$daemon_pid" || true # 发送 SIGTERM 信号
+                  sleep 2 # 等待进程退出
+                  # 如果进程仍在运行，发送 SIGKILL 信号强制终止
+                  if ps -p "$daemon_pid" > /dev/null 2>&1; then
+                      echo "[Cleanup] OpenVPN 守护进程 (PID: $daemon_pid) 未优雅退出，尝试强制停止 (SIGKILL)..."
+                      sudo kill -9 "$daemon_pid" || true
                   fi
-                  # 清理PID文件
-                  sudo rm -f "${OPENVPN_DAEMON_PID_FILE}" || true
+                  sudo rm -f "${OPENVPN_DAEMON_PID_FILE}" || true # 清理 PID 文件
               fi
-              echo "--- 清理完成 ---"
+              echo "--- [阶段 3/3] 清理完成 ---"
           }
+          # 设置 trap，在当前步骤退出时执行清理函数
+          trap cleanup_processes_step3 EXIT
 
-          # 设置 trap，在脚本退出时（无论成功或失败）执行 cleanup_processes 函数
-          trap cleanup_processes EXIT
+          echo "--- [阶段 3/3] 启动持续外部网络检查循环 ---"
 
-          # --- 启动 OpenVPN 守护进程函数 (简化版，无连接验证) ---
-          # 此函数只负责启动 OpenVPN 进程并确认其守护进程已运行
-          # 如果需要查看 OpenVPN 自身的日志，请移除 >/dev/null 2>&1
-          start_openvpn_daemon() {
-              set -eu # 在函数内部启用 set -eu
+          echo "[Network Check] 等待 30 秒确保网络稳定后开始检查循环..."
+          sleep 30 # 开始循环前的等待
 
-              echo "--- [VPN Setup] 开始启动 OpenVPN 守护进程 ---"
-              local OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
-              local CONFIG_DIR="/etc/openvpn/client"
-              local CONFIG_FILE="${CONFIG_DIR}/client.conf"
-              local PID_FILE="${OPENVPN_DAEMON_PID_FILE}"
+          echo "[Network Check] 循环开始前的网络状态简要检查:"
+          ip route show default || echo "无法获取默认路由" # 显示当前默认路由
 
-              echo "[VPN Setup] 安装 OpenVPN 软件包..."
-              if ! dpkg -s openvpn > /dev/null 2>&1; then
-                sudo apt-get update
-                sudo apt-get install -y openvpn
-              else
-                echo "[VPN Setup] OpenVPN 软件包已安装."
-              fi
+          # 无限循环进行网络检查
+          while true; do
+            echo "[Network Check] --- 外部检查开始 $(date) ---"
+            local TARGET_URL="https://www.google.com" # 检查外部连通性的目标 URL
+            # 使用 --fail 选项：如果 HTTP 状态码非 2xx 或发生连接错误，curl 将以非零退出码退出
+            # 由于设置了 set -e，curl 失败将导致本脚本在此处立即终止
+            if curl -sSL --fail --max-time 10 --connect-timeout 5 -o /dev/null "${TARGET_URL}"; then
+              echo "[Network Check] ✓ ${TARGET_URL} 连接成功。" # 检查成功
+            else
+              # curl 失败时的日志信息
+              local STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
+              echo "[Network Check] ✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE})。本任务将退出。"
+              exit 1 # 显式退出，触发 set -e 和 trap
+            fi
+            echo "[Network Check] --- 外部检查结束 $(date) ---"
+            sleep 60 # 等待 1 分钟进行下一次检查
+          done
+          # 这是一个无限循环，正常情况下不会执行到这里，除非脚本因错误退出
 
-              echo "[VPN Setup] 创建配置目录: ${CONFIG_DIR}"
-              sudo mkdir -p "${CONFIG_DIR}"
-              sudo chmod 700 "${CONFIG_DIR}"
-
-              echo "[VPN Setup] 创建 OpenVPN 配置文件: ${CONFIG_FILE} (从 Secret)"
-              echo "${OPENVPN_CONFIG_CONTENT}" | sudo sh -c "cat > ${CONFIG_FILE}"
-              sudo chmod 600 "${CONFIG_FILE}"
-
-              echo "[VPN Setup] 启动 OpenVPN 客户端 (后台运行，PID写入 ${PID_FILE})..."
-              # 使用 --verb 3 控制输出，并重定向到空，除非需要调试
-              sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" --verb 3 >/dev/null 2>&1 &
-              # $! 是 sudo openvpn 命令的 PID，很快会退出。我们依赖 PID 文件。
-
-              echo "[VPN Setup] 等待 OpenVPN 守护进程 PID 文件出现 (最多 15 秒)..."
-              local WAIT_PID_TIMEOUT=15 # 等待 PID 文件出现的时间
-              local END_WAIT_PID=$((SECONDS + WAIT_PID_TIMEOUT))
-              local daemon_pid=""
-
-              while [ $SECONDS -lt $END_WAIT_PID ]; do
-                  if [ -f "${PID_FILE}" ] && [ -s "${PID_FILE}" ]; then
-                       daemon_pid=$(cat "${PID_FILE}")
-                       # 检查进程是否存在
-                       if ps -p "$daemon_pid" > /dev/null 2>&1; then
-                           echo "[VPN Setup] OpenVPN 守护进程已启动，PID: $daemon_pid."
-                           break # 找到 PID 并且进程正在运行
-                       fi
-                  fi
-                  sleep 1
-              done
-
-              # 再次确认进程是否运行
-              if [ -n "$daemon_pid" ] && ps -p "$daemon_pid" > /dev/null 2>&1; then
-                  echo "[VPN Setup] ✓ OpenVPN 守护进程已确认运行。"
-                  return 0 # <-- 修改这里，使用 return 0
-              else
-                  echo "[VPN Setup] ✗ OpenVPN 守护进程未能在 ${WAIT_PID_TIMEOUT} 秒内确认运行。启动失败。"
-                  return 1 # <-- 修改这里，使用 return 1
-              fi
-          }
-
-          # --- 下载并运行脚本函数 (保持不变) ---
-          download_and_run_script() {
-              set -eux
-              echo "--- [Script Task] 开始下载 quick_start.sh ---"
-
-              curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
-              chmod +x quick_start.sh
-
-              echo "[Script Task] 等待 30 秒后运行 quick_start.sh..." # 脚本内的等待
-              sleep 30
-
-              echo "[Script Task] 执行 quick_start.sh..."
-              sudo bash quick_start.sh
-              echo "[Script Task] ✓ quick_start.sh 执行完毕。"
-              exit 0 # 成功退出函数和脚本
-          }
-
-          # --- 循环检查外部网络函数 (保持不变) ---
-          run_network_check_loop() {
-              set -e # 遇到错误（如 curl --fail 失败）立即退出
-              echo "--- [Network Check Task] 开始持续检查外部网络连接 (每隔 1 分钟一次) ---"
-
-              echo "[Network Check Task] 等待 30 秒确保网络稳定..."
-              sleep 30
-
-              echo "[Network Check Task] 循环开始前的网络状态简要检查:"
-              ip route show default || echo "无法获取默认路由"
-
-
-              while true; do
-                echo "[Network Check Task] --- 外部网络检查开始 $(date) ---"
-                local TARGET_URL="https://www.google.com" # 检查外部目标
-                # --fail: 任何HTTP错误或连接问题都会导致 curl 返回非零退出码
-                if curl -sSL --fail --max-time 10 --connect-timeout 5 -o /dev/null "${TARGET_URL}"; then
-                  echo "[Network Check Task] ✓ ${TARGET_URL} 连接成功。"
-                else
-                  local STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
-                  echo "[Network Check Task] ✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE})。此任务将退出。"
-                  exit 1 # 显式退出，配合 set -e 确保失败
-                fi
-                echo "[Network Check Task] --- 外部网络检查结束 $(date) ---"
-                sleep 60 # 等待1分钟
-              done
-              # 无限循环，正常情况下不会到达这里
-          }
-
-
-          # --- 主执行流程 (顺序执行) ---
-          echo "开始顺序执行流程: OpenVPN启动 -> 固定等待 -> 脚本执行 -> 外部网络检查循环"
-
-          # 1. 启动 OpenVPN 守护进程
-          echo "--- 阶段 1: 启动 OpenVPN 守护进程 ---"
-          # 调用函数，主脚本等待函数返回
-          start_openvpn_daemon
-          # 捕获 start_openvpn_daemon 函数的返回值
-          START_DAEMON_STATUS=$?
-
-          # 检查返回值，如果不为0则说明启动失败
-          if [ $START_DAEMON_STATUS -ne 0 ]; then
-              echo "✗ 阶段 1: OpenVPN 守护进程启动失败 (返回码: $START_DAEMON_STATUS)。终止作业。"
-              # exit 1 导致整个步骤/作业失败，trap 会被触发
-              exit 1
-          fi
-
-          # 如果函数返回 0，则主脚本继续执行
-          echo "✓ 阶段 1: OpenVPN 守护进程成功启动并确认运行。"
-
-          # 2. 固定等待时间
-          # 这个时间用于等待 VPN 连接建立和网络配置完成
-          local FIXED_WAIT_SECONDS=45 # <-- 根据您的 OpenVPN 连接速度调整此值
-          echo "--- 阶段 2: 等待 ${FIXED_WAIT_SECONDS} 秒，给 VPN 连接和网络配置时间 ---"
-          sleep ${FIXED_WAIT_SECONDS}
-          echo "✓ 阶段 2: 固定等待完成。继续执行后续步骤，VPN 连接状态未知。"
-
-          # 3. 运行 quick_start.sh 脚本
-          echo "--- 阶段 3: 运行 quick_start.sh 脚本 ---"
-          # 在前台运行 download_and_run_script 函数，主脚本会等待它完成
-          download_and_run_script
-          # 捕获 download_and_run_script 函数的退出状态
-          SCRIPT_EXIT_STATUS=$?
-
-          # 检查脚本的退出状态，如果不为0则说明脚本执行失败
-          if [ $SCRIPT_EXIT_STATUS -ne 0 ]; then
-              echo "✗ 阶段 3: 脚本执行失败 (退出码: $SCRIPT_EXIT_STATUS)。终止作业。"
-              # exit 1 导致整个步骤/作业失败，trap 会被触发
-              exit 1
-          fi
-
-          # 如果脚本执行成功，则主脚本继续
-          echo "✓ 阶段 3: 脚本执行成功。"
-
-          # 4. 启动循环检查外部网络 (这将阻塞作业，直到超时或检查失败)
-          echo "--- 阶段 4: 启动持续外部网络检查循环 ---"
-          # 在前台运行 run_network_check_loop 函数，它的无限循环会接管主脚本的执行
-          run_network_check_loop
-
-          # 以下行理论上不会被达到，因为 run_network_check_loop 是一个无限循环
-          echo "流程意外结束 (网络检查循环退出)."
-          # run_network_check_loop 函数的退出状态将决定整个步骤的最终状态（通常是由于错误退出1）
-
-          # trap 会在脚本最终退出时（无论成功或失败）被调用进行清理。
-
-        shell: bash # 明确使用bash执行脚本
-
-      # --- 原有的循环检查网络连接步骤 已被合并到上一步 ---
-      # 此步骤已移除
+        shell: bash # 使用 bash 执行脚本
