@@ -97,7 +97,8 @@ jobs:
               echo "[VPN任务] 启动 OpenVPN 客户端 (后台运行，PID写入 ${PID_FILE})..."
               # 注意: sudo openvpn 命令本身会fork一个守护进程。这里的 '&' 是为了让此 openvpn 命令的*启动*不阻塞父脚本。
               # 我们依赖 --writepid 和后续的 ps 检查来确认 OpenVPN 守护进程的状态。
-              sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" &
+              # --- 这里添加了 --verb 3 参数来控制 OpenVPN 的日志输出 ---
+              sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" --verb 3 &
               # 重要：OpenVPN 守护进程的 PID 会被写入 PID_FILE，而不是 $!。
               # 此处的 $! 是 sudo openvpn 这个父进程（非守护进程）的PID，它会很快退出。
 
@@ -123,7 +124,7 @@ jobs:
 
 
               echo "[VPN任务] 验证 OpenVPN 连接..."
-              local TIMEOUT_SECONDS=90
+              local TIMEOUT_SECONDS=180
               local VPN_IFACE="tun0" # 关键: 确认您的 VPN 接口名称，OpenVPN 通常是 tun0
 
               local END_TIME=$((SECONDS + TIMEOUT_SECONDS))
@@ -170,8 +171,8 @@ jobs:
               curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
               chmod +x quick_start.sh # 使脚本可执行
 
-              echo "[脚本任务] 等待 15 秒后运行 quick_start.sh..." # 新增的等候时间
-              sleep 15
+              echo "[脚本任务] 等待 30 秒后运行 quick_start.sh..." # 新增的等候时间
+              sleep 30
 
               echo "[脚本任务] 执行 quick_start.sh..."
               # 根据 quick_start.sh 的内容决定是使用 bash 执行还是直接执行
