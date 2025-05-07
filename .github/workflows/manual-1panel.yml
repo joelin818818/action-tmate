@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@v4 # 检出你的代码仓库
 
       # --- 合并后的步骤：并发连接OpenVPN、运行脚本、循环检查网络 ---
-      - name: 并发：连接OpenVPN、运行脚本并循环检查网络
+      - name: 并发：连接OpenVPN、验证出口IP并循环检查网络 (脚本稍后运行)
         run: |
           #!/bin/bash
           # 主脚本层面不使用 set -e，以便手动处理后台任务的成功/失败
@@ -22,26 +22,27 @@ jobs:
 
           # --- 全局变量和清理 ---
           VPN_START_PID=""
-          SCRIPT_RUN_PID=""
+          SCRIPT_RUN_PID="" # 现在脚本任务不是立即后台启动，所以这个PID可能不用于wait
           NET_CHECK_PID=""
           # OpenVPN守护进程的PID文件 (由 --writepid 生成)
           OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # 更改文件名避免冲突
-          # 用于存储自动检测到的VPN接口名称
+          # 自动检测到的VPN接口名称 (在这个验证逻辑下可能不被设置或不重要)
           DETECTED_VPN_IFACE=""
 
           # 清理后台进程的函数
           cleanup_processes() {
               echo "--- 清理后台进程 ---"
-              # 尝试停止网络检查循环任务
+               # 尝试停止网络检查循环任务 (如果在后台运行)
               if [ -n "$NET_CHECK_PID" ] && ps -p "$NET_CHECK_PID" > /dev/null 2>&1; then
                   echo "尝试停止网络检查进程 (PID: $NET_CHECK_PID)..."
                   kill "$NET_CHECK_PID" || true # kill可能会失败，使用 || true 忽略错误
               fi
-              # 尝试停止脚本运行任务
-              if [ -n "$SCRIPT_RUN_PID" ] && ps -p "$SCRIPT_RUN_PID" > /dev/null 2>&1; then
-                  echo "尝试停止脚本运行进程 (PID: $SCRIPT_RUN_PID)..."
-                  kill "$SCRIPT_RUN_PID" || true
-              fi
+               # 注意：SCRIPT_RUN_PID 在新的主逻辑中可能不是后台进程，清理时要注意
+              # 尝试停止脚本运行任务 (如果它还在运行并且是后台进程)
+              # if [ -n "$SCRIPT_RUN_PID" ] && ps -p "$SCRIPT_RUN_PID" > /dev/null 2>&1; then
+              #     echo "尝试停止脚本运行进程 (PID: $SCRIPT_RUN_PID)..."
+              #     kill "$SCRIPT_RUN_PID" || true
+              # fi
               # 尝试停止VPN启动函数进程 (如果它还在等待OpenVPN守护进程启动)
               if [ -n "$VPN_START_PID" ] && ps -p "$VPN_START_PID" > /dev/null 2>&1; then
                   echo "尝试停止VPN启动函数进程 (PID: $VPN_START_PID)..."
@@ -69,7 +70,7 @@ jobs:
           # 设置 trap，在脚本退出时（无论成功或失败）执行 cleanup_processes 函数
           trap cleanup_processes EXIT
 
-          # --- OpenVPN 连接与验证函数 ---
+          # --- OpenVPN 连接与验证函数 (通过检查出口IP国家) ---
           connect_vpn_and_verify() {
               # 在此函数 (子shell) 内部启用 set -eux
               set -eux
@@ -125,11 +126,18 @@ jobs:
               fi
 
 
-              echo "[VPN任务] 验证 OpenVPN 连接状态并检测接口..."
+              echo "[VPN任务] 验证出口IP国家..."
               # --- 增加超时时间到 300 秒 (5分钟) ---
               local TIMEOUT_SECONDS=300
               local END_TIME=$((SECONDS + TIMEOUT_SECONDS))
-              local found_vpn_iface="" # 用于暂存找到的接口名称
+              # --- 期望的出口国家代码 ---
+              local TARGET_COUNTRY_CODE="CN"
+              # --- 获取出口IP国家的服务 URL ---
+              # 可以选择其他服务，例如：
+              # https://ip.gs/country
+              # https://ipapi.co/country
+              local IP_COUNTRY_SERVICE_URL="https://ipinfo.io/country"
+
 
               while [ $SECONDS -lt $END_TIME ]; do
                 # 检查 OpenVPN 守护进程是否仍在运行 (通过PID文件)
@@ -138,49 +146,39 @@ jobs:
                   exit 1 # 表示此函数失败，触发 cleanup trap
                 fi
 
-                echo "[VPN任务] 尝试查找并验证 tun/tap 接口和路由... 剩余 $((END_TIME - SECONDS)) 秒"
+                echo "[VPN任务] 尝试获取出口IP国家并验证 (${TARGET_COUNTRY_CODE})... 剩余 $((END_TIME - SECONDS)) 秒"
 
-                # 查找所有可能的 tun 或 tap 接口
-                local potential_ifaces=$(ip link show | awk '/(tun|tap)[0-9]+:/{print $2}' | sed 's/://')
-                found_vpn_iface="" # 重置找到的接口名称，防止上一次循环的残留
-
-                # 遍历潜在接口，检查其状态和路由
-                for iface in ${potential_ifaces}; do
-                    # 检查接口是否 UP 并且有 IP 地址
-                    if ip addr show "$iface" | grep -q "state UP" && ip addr show "$iface" | grep -q "inet "; then
-                        # 检查默认路由是否通过这个接口
-                        if ip route show default | grep -q "$iface"; then
-                            # 找到了符合条件的接口
-                            found_vpn_iface="$iface"
-                            break # 跳出内层循环 (找到接口了)
-                        else
-                             # 接口 UP 且有 IP，但默认路由没走它
-                             echo "[VPN任务] 接口 ${iface} 已出现并有 IP，但默认路由未通过它。"
-                        fi
-                    # else: 接口存在，但不是 UP 状态或还没 IP - 继续等待
+                local current_country=""
+                # 使用 curl 获取出口国家代码，--fail 确保网络不通或服务返回非2xx时失败
+                # 将 stderr 重定向到 /dev/null，只关心 stdout
+                if current_country=$(curl -sS --fail --max-time 10 "$IP_COUNTRY_SERVICE_URL" 2>/dev/null); then
+                    echo "[VPN任务] 检测到的出口IP国家: ${current_country}"
+                    if [ "$current_country" = "$TARGET_COUNTRY_CODE" ]; then
+                        echo "[VPN任务] ✓ 出口IP国家 (${current_country}) 符合预期 (${TARGET_COUNTRY_CODE}). VPN 连接验证成功。"
+                        # 在这里尝试查找 VPN 接口（可选，仅用于日志或 DETECTED_VPN_IFACE 变量设置）
+                        # 这种验证方式不直接提供接口名，只能尽力猜
+                        local final_iface=$(ip link show | awk '/(tun|tap)[0-9]+:/{print $2}' | sed 's/://')
+                         for iface in ${final_iface}; do
+                            if ip addr show "$iface" | grep -q "inet "; then
+                                export DETECTED_VPN_IFACE="$iface"
+                                echo "[VPN任务] 找到可能的 VPN 接口: ${DETECTED_VPN_IFACE}"
+                                break # Found one with an IP
+                            fi
+                         done
+                        echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
+                        exit 0 # 表示此函数成功
+                    else
+                        echo "[VPN任务] ✗ 出口IP国家 (${current_country}) 不符合预期 (${TARGET_COUNTRY_CODE})."
                     fi
-                done
-
-                if [ -n "$found_vpn_iface" ]; then
-                    # 如果找到了符合条件的接口
-                    echo "[VPN任务] ✓ VPN 连接成功，检测到接口 ${found_vpn_iface}，默认路由通过它。"
-                    echo "[VPN任务] === IP Addr (${found_vpn_iface}) ==="
-                    ip addr show "$found_vpn_iface"
-                    echo "[VPN任务] === Route Table (Default) ==="
-                    ip route show default
-                    echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
-                    # 将检测到的接口名称导出到主脚本的环境变量中
-                    export DETECTED_VPN_IFACE="$found_vpn_iface"
-                    exit 0 # 表示此函数成功
                 else
-                    # 没有找到符合条件的接口，继续等待
-                     echo "[VPN任务] 未在任何 tun/tap 接口上检测到默认路由。继续等待..."
+                    # curl 失败，可能网络不通或服务不可达
+                    echo "[VPN任务] ✗ 无法获取出口IP国家 (${IP_COUNTRY_SERVICE_URL} 不可达或返回错误). Curl exited with: $?."
                 fi
 
                 sleep 10 # 每次检查之间等待10秒
               done
 
-              echo "[VPN任务] ✗ OpenVPN 连接超时（${TIMEOUT_SECONDS}秒内未检测到有效接口和默认路由）。"
+              echo "[VPN任务] ✗ OpenVPN 连接超时（${TIMEOUT_SECONDS}秒内未检测到符合预期的出口IP国家）。"
               # 触发 cleanup trap 并退出
               exit 1 # 表示此函数失败
             }
@@ -190,12 +188,13 @@ jobs:
               # 在此函数 (子shell) 内部启用 set -eux
               set -eux
               echo "--- [脚本任务] 开始下载 quick_start.sh ---"
-              # 如果 quick_start.sh 依赖 VPN，它可能会在 VPN 完全就绪前尝试执行网络操作
-              # 因此，quick_start.sh 自身需要有足够的鲁棒性或等待逻辑（如果它强依赖VPN）
+              # 这个函数现在在主逻辑中等待 VPN 连接成功后才会被调用
+
               curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
               chmod +x quick_start.sh # 使脚本可执行
 
-              echo "[脚本任务] 等待 30 秒后运行 quick_start.sh..." # 新增的等候时间
+              # 这里的等待可以保留，作为在 VPN 连接验证成功后执行脚本前的额外缓冲
+              echo "[脚本任务] 等待 30 秒后运行 quick_start.sh..."
               sleep 30
 
               echo "[脚本任务] 执行 quick_start.sh..."
@@ -218,23 +217,22 @@ jobs:
                 echo "[网络检查任务] 等待30秒，确保网络环境稳定..."
                 sleep 30
 
+                # 这个函数现在在主逻辑中与 VPN 连接任务同时启动
+                # 它自己的检查会独立进行，并在 curl 失败时导致整个步骤失败
+                # 循环开始前的 VPN 状态检查可以使用 DETECTED_VPN_IFACE (如果已设置)
+                # 但主要依赖的是循环内部的 curl 检查是否通过 VPN 出口
+
                 # 使用自动检测到的接口名称进行检查，如果未设置则退回到 tun0 (理论上 VPN_START_PID 成功后此变量应已设置)
                 local VPN_IFACE="${DETECTED_VPN_IFACE:-tun0}"
-                echo "[网络检查任务] 循环开始前的 VPN 状态简要检查 (接口: ${VPN_IFACE}):"
+                echo "[网络检查任务] 循环开始前的 VPN 状态简要检查 (接口: ${VPN_IFACE} - 仅供参考):"
 
-                # 检查接口是否存在、有IP、默认路由是否通过它
-                if [ -n "$VPN_IFACE" ] && ip addr show "${VPN_IFACE}" &>/dev/null && ip addr show "${VPN_IFACE}" | grep -q "inet " && ip route show default | grep -q "${VPN_IFACE}"; then
-                  echo "[网络检查任务] ✓ VPN 接口 (${VPN_IFACE}) 在循环检查前确认可用，默认路由正确。"
+                # 这里的检查不是强制成功的条件，仅用于日志
+                if [ -n "$VPN_IFACE" ] && ip addr show "${VPN_IFACE}" &>/dev/null; then
+                   echo "[网络检查任务] 可能的 VPN 接口 ${VPN_IFACE} 存在。"
                 else
-                  echo "[网络检查任务] ⚠ 警告: VPN 接口 (${VPN_IFACE}) 在循环检查前似乎未完全就绪或默认路由不通过VPN。检查将继续进行，但可能失败。"
-                  ip route show default || echo "无法获取默认路由"
-                   # 只有在检测到接口名称不为空时才尝试显示其状态
-                  if [ -n "$VPN_IFACE" ]; then
-                      ip addr show "${VPN_IFACE}" || echo "${VPN_IFACE} 接口不存在或获取状态失败"
-                  else
-                       echo "未检测到VPN接口名称 ($DETECTED_VPN_IFACE 变量为空)."
-                  fi
+                   echo "[网络检查任务] 可能的 VPN 接口 ${VPN_IFACE} 似乎不存在。"
                 fi
+                ip route show default || echo "无法获取默认路由"
 
 
                 while true; do
@@ -242,13 +240,14 @@ jobs:
                   local TARGET_URL="https://www.google.com" # 检查目标
                   # 使用 --fail 选项，任何HTTP错误或连接问题都会导致 curl 返回非零退出码
                   # 由于设置了 set -e，这将导致此后台脚本在此刻终止，进而使整个步骤失败
+                  # 这个 curl 检查会通过当前的默认路由进行，如果 VPN 生效，就会走 VPN
                   if curl -sSL --fail --max-time 10 --connect-timeout 5 -o /dev/null "${TARGET_URL}"; then
-                    echo "[网络检查任务] ✓ ${TARGET_URL} 连接成功并通过 VPN 响应正常。"
+                    echo "[网络检查任务] ✓ ${TARGET_URL} 连接成功。" # 这里的成功意味着通过当前路由(期望是VPN)成功连接
                   else
                     # 如果 curl --fail 失败，由于 set -e，此分支通常不会被完全执行，脚本会在此刻退出。
                     # 但是添加一些日志信息仍然有用，因为它可能在退出前被打印。
                     local STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
-                    echo "[网络检查任务] ✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE}) (通过 VPN)。"
+                    echo "[网络检查任务] ✗ ${TARGET_URL} 连接失败或响应异常 (状态码: ${STATUS_CODE})。此任务将退出。"
                     # set -e 会导致这里隐式退出，但为了明确意图，也可以加 explicit exit 1
                     exit 1 # 显式退出，确保失败
                   fi
@@ -260,81 +259,54 @@ jobs:
             }
 
 
-          # --- 主执行逻辑：启动并发任务并等待关键任务完成 ---
-          echo "启动 VPN 连接任务, 脚本执行任务, 和持续网络检查任务..."
+          # --- 主执行逻辑：启动并发任务，等待VPN，然后运行脚本 ---
+          echo "启动 VPN 连接任务 和 持续网络检查任务..."
 
-          # 启动所有任务到后台
-          # 注意： run_network_check_loop 在启动时 DETECTED_VPN_IFACE 可能还未被设置
-          # 它会在自己的启动后检查等待 VPN 连接函数设置该变量。
+          # 启动 VPN 连接任务到后台
           connect_vpn_and_verify &
           VPN_START_PID=$! # 获取 VPN 启动函数进程的 PID
           echo "VPN 连接任务启动进程 PID: ${VPN_START_PID}"
 
-          download_and_run_script &
-          SCRIPT_RUN_PID=$! # 获取脚本执行函数进程的 PID
-          echo "脚本执行任务进程 PID: ${SCRIPT_RUN_PID}"
-
+          # 启动持续网络检查任务到后台 (立即开始检查)
           run_network_check_loop &
           NET_CHECK_PID=$! # 获取网络检查循环进程的 PID
           echo "持续网络检查任务进程 PID: ${NET_CHECK_PID}"
 
-
-          echo "等待关键设置任务 (VPN 连接和 脚本执行) 完成..."
-
-          VPN_TASK_SUCCESS=false
-          SCRIPT_TASK_SUCCESS=false
-          OVERALL_SUCCESS=false
-
-          # 等待 VPN 任务完成并检查结果
-          # 如果此任务成功，它将设置 DETECTED_VPN_IFACE 变量
+          echo "等待 VPN 连接任务完成 (验证出口IP)..."
+          # 主脚本等待 VPN 连接任务成功
           wait $VPN_START_PID
           VPN_EXIT_STATUS=$?
-          if [ $VPN_EXIT_STATUS -eq 0 ]; then
-              echo "✓ VPN 连接任务成功完成。"
-              VPN_TASK_SUCCESS=true
-              # 确保变量已设置
-              if [ -z "$DETECTED_VPN_IFACE" ]; then
-                 echo "✗ 警告：VPN 连接任务成功退出，但未设置 DETECTED_VPN_IFACE 变量！"
-                 # 这种情况不应该发生，如果发生则可能逻辑有问题
-                 VPN_TASK_SUCCESS=false # 标记为逻辑失败
-                 # 继续清理并退出
-                 exit 1
-              else
-                 echo "→ 检测到的 VPN 接口名称: ${DETECTED_VPN_IFACE}"
-              fi
-          else
-              echo "✗ VPN 连接任务失败 (退出码: $VPN_EXIT_STATUS)。"
+
+          if [ $VPN_EXIT_STATUS -ne 0 ]; then
+              echo "✗ VPN 连接任务失败 (退出码: $VPN_EXIT_STATUS)。终止所有任务。"
               # cleanup trap 会在脚本退出时执行
               exit 1 # 整个步骤失败
           fi
 
-          # 等待脚本任务完成并检查结果
-          wait $SCRIPT_RUN_PID
+          echo "✓ VPN 连接任务成功并验证通过。"
+          # DETECTED_VPN_IFACE 如果在 VPN 函数中被设置（尽管不强制），在这里是可用的。
+
+          echo "开始运行 quick_start.sh 脚本..."
+          # 现在 VPN 已经连接并验证成功，运行脚本任务
+          # 不在后台运行，主脚本会等待它完成
+          download_and_run_script
+          # 获取 download_and_run_script 的退出状态
           SCRIPT_EXIT_STATUS=$?
-          if [ $SCRIPT_EXIT_STATUS -eq 0 ]; then
-              echo "✓ 下载并运行脚本任务成功完成。"
-              SCRIPT_TASK_SUCCESS=true
-          else
-              echo "✗ 下载并运行脚本任务失败 (退出码: $SCRIPT_EXIT_STATUS)。"
+
+          if [ $SCRIPT_EXIT_STATUS -ne 0 ]; then
+              echo "✗ 下载并运行脚本任务失败 (退出码: $SCRIPT_EXIT_STATUS)。终止所有任务。"
               # cleanup trap 会在脚本退出时执行
               exit 1 # 整个步骤失败
           fi
 
-          # 如果所有关键设置任务都成功了
-          if $VPN_TASK_SUCCESS && $SCRIPT_TASK_SUCCESS; then
-              echo "✓✓ 关键设置任务 (VPN 和 脚本) 均成功完成。"
-              echo "持续网络检查任务正在后台运行 (PID: ${NET_CHECK_PID}). Job 将运行直到超时 (${{ github.job.timeout }}) 或网络检查任务失败。"
-              OVERALL_SUCCESS=true
-              # 主要设置完成后，主脚本可以成功退出
-              # 后台的网络检查循环会继续运行，直到作业超时或循环内部的 curl 失败
-              # 如果后台循环失败 (由于 set -e 和 curl --fail)，其非零退出码会被 GitHub Actions 捕获，导致整个步骤失败。
-              exit 0
-          else
-              # 如果上面有任务失败，已经在相应的 if 分支里 exit 1 了。
-              # 这个分支理论上不会执行，但作为回退保留。
-              echo "✗✗ 一个或多个关键设置任务失败。VPN任务成功: $VPN_TASK_SUCCESS, 脚本任务成功: $SCRIPT_TASK_SUCCESS."
-              exit 1 # 整个步骤失败
-          fi
+          echo "✓ 下载并运行脚本任务成功完成。"
+          echo "✓✓ 关键设置任务 (VPN 和 脚本) 均成功完成。"
+          echo "持续网络检查任务正在后台运行 (PID: ${NET_CHECK_PID}). Job 将运行直到超时 (${{ github.job.timeout }}) 或网络检查任务失败。"
+
+          # 主脚本任务（等待 VPN 和 运行脚本）已全部成功完成
+          # 允许主脚本成功退出，后台的网络检查循环会继续运行
+          # 如果后台循环失败，GitHub Actions 会捕获到其非零退出码并标记整个步骤失败。
+          exit 0
 
           # trap 会在 exit 前被调用
 
