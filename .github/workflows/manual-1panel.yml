@@ -1,15 +1,30 @@
-# ... (name, on, jobs, runs-on, timeout-minutes, checkout) ...
+# Workflow definition starts here
+name: 在最新Ubuntu上运行脚本并循环检查网络 (通过OpenVPN) # 工作流名称
 
-      # --- Step 2 (Modified Step 1): 启动 OpenVPN 守护进程并验证出口IP国家 ---
+on:
+  workflow_dispatch: # 手动触发此工作流运行
+
+jobs:
+  run-on-ubuntu: # 作业名称
+    runs-on: ubuntu-latest # 在最新的Ubuntu环境上运行
+    timeout-minutes: 60 # 设置作业超时时间，防止长时间运行
+
+    steps:
+      # Step 1: 检出代码
+      - name: 检出代码 # 步骤名称
+        uses: actions/checkout@v4 # 使用actions/checkout@v4来检出代码仓库
+
+      # --- Step 2: 启动 OpenVPN 守护进程并验证出口IP国家 ---
       # OpenVPN 进程在此步骤启动并保持运行，并通过验证出口IP来确认连接成功
-      - name: 启动OpenVPN守护进程并验证出口IP国家 # 步骤名称已更改
-        id: setup-vpn # ID 保持不变，因为它是链条的第一环
+      - name: 启动OpenVPN守护进程并验证出口IP国家 # 步骤名称
+        id: setup-vpn # 给此步骤一个ID，供后续步骤引用
         run: | # 在Ubuntu运行器上执行Shell脚本
           #!/bin/bash
           # 遇到错误或使用未定义变量时立即退出，除非特别处理
           set -eu
 
           # OpenVPN 守护进程的 PID 文件路径
+          # (无 local, 因为在 run 脚本的顶层)
           PID_FILE="/tmp/openvpn_daemon.pid"
 
           echo "--- [阶段 1/3] 启动 OpenVPN 守护进程并验证出口IP国家 ---"
@@ -22,9 +37,12 @@
             echo "[VPN Setup] OpenVPN 软件包已安装."
           fi
 
-          local OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}" # 从 Secrets 获取 VPN 配置
-          local CONFIG_DIR="/etc/openvpn/client"
-          local CONFIG_FILE="${CONFIG_DIR}/client.conf"
+          # (无 local)
+          OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}" # 从 Secrets 获取 VPN 配置
+          # (无 local)
+          CONFIG_DIR="/etc/openvpn/client"
+          # (无 local)
+          CONFIG_FILE="${CONFIG_DIR}/client.conf"
 
           echo "[VPN Setup] 创建配置目录: ${CONFIG_DIR}"
           sudo mkdir -p "${CONFIG_DIR}"
@@ -34,18 +52,21 @@
           echo "${OPENVPN_CONFIG_CONTENT}" | sudo sh -c "cat > ${CONFIG_FILE}"
           sudo chmod 600 "${CONFIG_FILE}" # 设置文件权限
 
-          echo "[VPN Setup] 使用 nohup 启动 OpenVPN 守护进程 (PID 到 ${PID_FILE})..."
+          echo "[VPN Setup] 使用 nohup 启动 OpenVPN 客户端 (PID 到 ${PID_FILE})..."
           # 使用 nohup 和 & 让 OpenVPN 在后台运行，并尝试使其在此步骤结束后继续存在
           # --writepid 将守护进程的 PID 写入文件
-          # --verb 3 控制 OpenVPN 自身的日志级别
-          # >/dev/null 2>&1 重定向 OpenVPN 日志到空，减少 Actions 日志量
+          # --verb 3 控制 OpenVPN 自身的日志级别 (仅必要信息)
+          # >/dev/null 2>&1 重定向 OpenVPN 日志到空，减少 Actions 日志量 (按需保留/移除)
           nohup sudo openvpn --config "${CONFIG_FILE}" --writepid "${PID_FILE}" --verb 3 >/dev/null 2>&1 &
           # $! 是 nohup 命令的 PID，不是 OpenVPN 守护进程的 PID
 
           echo "[VPN Setup] 等待 OpenVPN 守护进程 PID 文件出现并确认进程运行 (最多 20 秒)..."
-          local WAIT_PID_TIMEOUT=20 # 等待 PID 文件和进程出现的时间
-          local END_WAIT_PID=$((SECONDS + WAIT_PID_PID_TIMEOUT)) # Corrected variable name
-          local daemon_pid=""
+          # (无 local)
+          WAIT_PID_TIMEOUT=20 # 等待 PID 文件和进程出现的时间
+          # (无 local)
+          END_WAIT_PID=$((SECONDS + WAIT_PID_TIMEOUT))
+          # (无 local)
+          daemon_pid="" # 初始化变量
 
           # 循环等待 PID 文件和进程
           while [ $SECONDS -lt $END_WAIT_PID ]; do
@@ -60,59 +81,78 @@
           done
 
           # 检查最终是否确认守护进程运行。如果守护进程都没起来，直接失败。
-          if [ -z "$daemon_pid" ] || ! ps -p "$daemon_pid" > /dev/null 2>&1; then # Check if daemon_pid is empty OR process not running
+          # (无 local)
+          DAEMON_START_SUCCESS=false
+          if [ -n "$daemon_pid" ] && ps -p "$daemon_pid" > /dev/null 2>&1; then
+              echo "[VPN Setup] ✓ OpenVPN 守护进程确认运行。"
+              DAEMON_START_SUCCESS=true
+          else
               echo "[VPN Setup] ✗ OpenVPN 守护进程未能在 ${WAIT_PID_TIMEOUT} 秒内确认运行。启动失败。"
-              exit 1 # Step fails
+              exit 1 # 步骤失败退出
           fi
 
-          echo "[VPN Setup] ✓ OpenVPN 守护进程确认运行。开始验证出口IP国家..."
+          # --- 如果守护进程启动成功，开始验证出口IP国家循环 ---
+          if "$DAEMON_START_SUCCESS"; then
+              echo "[VPN Setup] 开始验证出口IP国家..."
 
-          # --- 验证出口IP国家循环 ---
-          local VERIFY_TIMEOUT_SECONDS=300 # 验证出口IP的总超时时间 (例如 5 分钟)
-          local CHECK_INTERVAL_SECONDS=5 # 每次验证检查的间隔时间 (例如 5 秒)
-          local END_VERIFY_TIME=$((SECONDS + VERIFY_TIMEOUT_SECONDS))
-          local TARGET_COUNTRY_CODE="CN" # <--- 您期望的出口国家代码
-          # 获取出口IP国家的服务 URL
-          # 使用 --fail 避免 curl --fail 触发 set -e
-          local IP_COUNTRY_SERVICE_URL="https://ipinfo.io/country"
+              # (无 local)
+              VERIFY_TIMEOUT_SECONDS=300 # 验证出口IP的总超时时间 (例如 5 分钟)
+              # (无 local)
+              CHECK_INTERVAL_SECONDS=5 # 每次验证检查的间隔时间 (例如 5 秒)
+              # (无 local)
+              END_VERIFY_TIME=$((SECONDS + VERIFY_TIMEOUT_SECONDS))
+              # (无 local)
+              TARGET_COUNTRY_CODE="CN" # <--- 您期望的出口国家代码
+              # (无 local)
+              IP_COUNTRY_SERVICE_URL="https://ipinfo.io/country" # 获取出口IP国家的服务 URL
 
-          while [ $SECONDS -lt $END_VERIFY_TIME ]; do
-              # Check OpenVPN daemon process within verification loop (essential)
-              if ! ps -p "$daemon_pid" > /dev/null 2>&1; then
-                 echo "[VPN Setup] ✗ OpenVPN 守护进程意外退出 (PID: $daemon_pid) 在验证过程中。"
-                 exit 1 # Step fails
-              fi
-
-              echo "[VPN Setup] 尝试获取出口IP国家并验证 (${TARGET_COUNTRY_CODE})... 剩余 $((END_VERIFY_TIME - SECONDS)) 秒"
-
-              local current_country=""
-              # 使用 curl 获取出口国家代码，--fail 确保网络不通或服务返回非2xx时失败
-              # 捕获标准输出，忽略标准错误
-              if current_country=$(curl -sS --fail --max-time 10 "$IP_COUNTRY_SERVICE_URL" 2>/dev/null); then
-                  echo "[VPN Setup] 检测到的出口IP国家: ${current_country}"
-                  if [ "$current_country" = "$TARGET_COUNTRY_CODE" ]; then
-                      echo "[VPN Setup] ✓ 出口IP国家 (${current_country}) 符合预期 (${TARGET_COUNTRY_CODE}). VPN 连接验证成功。"
-                      echo "--- [阶段 1/3] VPN 连接已成功验证 ---"
-                      exit 0 # <-- Step 1 succeeds upon verification
-                  else
-                      echo "[VPN Setup] ✗ 出口IP国家 (${current_country}) 不符合预期 (${TARGET_COUNTRY_CODE})."
+              # 循环验证出口IP国家
+              while [ $SECONDS -lt $END_VERIFY_TIME ]; do
+                  # Check OpenVPN daemon process within verification loop (essential)
+                  if ! ps -p "$daemon_pid" > /dev/null 2>&1; then
+                     echo "[VPN Setup] ✗ OpenVPN 守护进程意外退出 (PID: $daemon_pid) 在验证过程中。"
+                     exit 1 # Step fails
                   fi
-              else
-                  # curl 失败，可能网络不通或服务不可达
-                  local curl_status=$?
-                  echo "[VPN Setup] ✗ 无法获取出口IP国家 (${IP_COUNTRY_SERVICE_URL} 不可达或返回错误). Curl exited with: ${curl_status}."
-                  # 针对常见的 curl 错误码提供更多信息 (Optional, can omit in minimal version)
-                  # if [ "$curl_status" -eq 6 ]; then echo "[VPN Setup] (错误详情: 无法解析或连接主机)"; fi
-                  # if [ "$curl_status" -eq 7 ]; then echo "[VPN Setup] (错误详情: 连接被拒绝)"; fi
-                  # if [ "$curl_status" -eq 28 ]; then echo "[VPN Setup] (错误详情: 连接超时)"; fi
-              fi
 
-              sleep ${CHECK_INTERVAL_SECONDS} # 等待指定间隔进行下一次检查
-          done
+                  echo "[VPN Setup] 尝试获取出口IP国家并验证 (${TARGET_COUNTRY_CODE})... 剩余 $((END_VERIFY_TIME - SECONDS)) 秒"
 
-          # 如果循环超时仍未验证成功
-          echo "[VPN Setup] ✗ 出口IP国家验证超时（${VERIFY_TIMEOUT_SECONDS}秒内未能检测到符合预期的出口IP国家）。"
-          exit 1 # Step fails due to verification timeout
+                  # (无 local)
+                  current_country=""
+                  # 使用 curl 获取出口国家代码，--fail 确保网络不通或服务返回非2xx时失败
+                  # 捕获标准输出，忽略标准错误
+                  if current_country=$(curl -sS --fail --max-time 10 "$IP_COUNTRY_SERVICE_URL" 2>/dev/null); then
+                      echo "[VPN Setup] 检测到的出口IP国家: ${current_country}"
+                      if [ "$current_country" = "$TARGET_COUNTRY_CODE" ]; then
+                          echo "[VPN Setup] ✓ 出口IP国家 (${current_country}) 符合预期 (${TARGET_COUNTRY_CODE}). VPN 连接验证成功。"
+                          echo "--- [阶段 1/3] VPN 连接已成功验证 ---"
+                          exit 0 # <-- Step 1 succeeds upon verification
+                      else
+                          echo "[VPN Setup] ✗ 出口IP国家 (${current_country}) 不符合预期 (${TARGET_COUNTRY_CODE})."
+                      fi
+                  else
+                      # curl 失败，可能网络不通或服务不可达
+                      # (无 local)
+                      curl_status=$?
+                      echo "[VPN Setup] ✗ 无法获取出口IP国家 (${IP_COUNTRY_SERVICE_URL} 不可达或返回错误). Curl exited with: ${curl_status}."
+                      # 针对常见的 curl 错误码提供更多信息 (可选)
+                      # if [ "$curl_status" -eq 6 ]; then echo "[VPN Setup] (错误详情: 无法解析或连接主机)"; fi
+                      # if [ "$curl_status" -eq 7 ]; then echo "[VPN Setup] (错误详情: 连接被拒绝)"; fi
+                      # if [ "$curl_status" -eq 28 ]; then echo "[VPN Setup] (错误详情: 连接超时)"; fi
+                  fi
+
+                  sleep ${CHECK_INTERVAL_SECONDS} # 等待指定间隔进行下一次检查
+              done
+
+              # 如果循环超时仍未验证成功
+              echo "[VPN Setup] ✗ 出口IP国家验证超时（${VERIFY_TIMEOUT_SECONDS}秒内未能检测到符合预期的出口IP国家）。"
+              exit 1 # Step fails due to verification timeout
+          fi # End of if "$DAEMON_START_SUCCESS" block
+
+          # Should not be reached if "$DAEMON_START_SUCCESS" is false, as it exits before.
+          # If "$DAEMON_START_SUCCESS" is true, the while loop runs until it exits 0 or 1.
+          # Add a final safety exit in case something unexpected happens
+          echo "[VPN Setup] 意外结束 Step 1."
+          exit 1 # Should not happen
 
         shell: bash # 使用 bash 执行脚本
 
@@ -129,8 +169,12 @@
           echo "--- [阶段 2/3] 下载 quick_start.sh 脚本 (用于安装 1Panel) ---" # 更新日志信息
 
           echo "[Download Task] 下载 quick_start.sh 脚本..."
-          # 只保留下载命令，删除 chmod, sleep, sudo bash 执行命令
-          curl -sSL https://resource.fit2cloud.com/1panel/package/quick_start.sh -o quick_start.sh
+          # 只保留下载命令
+          # (无 local)
+          DOWNLOAD_URL="https://resource.fit2cloud.com/1panel/package/quick_start.sh"
+          # (无 local)
+          OUTPUT_FILE="quick_start.sh"
+          curl -sSL "$DOWNLOAD_URL" -o "$OUTPUT_FILE"
 
           echo "[Download Task] ✓ quick_start.sh 下载完毕。"
           # set -eux 会确保如果 curl 下载失败，此脚本会以非零退出码退出
@@ -147,12 +191,13 @@
 
           # --- 此步骤的清理函数 ---
           # 此 trap 确保当本步骤退出时，OpenVPN 守护进程被尝试停止
-          local OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # OpenVPN PID 文件路径
-          cleanup_processes_step3() {
+          # (无 local)
+          OPENVPN_DAEMON_PID_FILE="/tmp/openvpn_daemon.pid" # OpenVPN PID 文件路径
+          cleanup_processes_step4() { # 函数名也改为 Step 4 相关
               echo "--- [阶段 3/3] 清理 OpenVPN 守护进程 ---"
               # 检查 PID 文件是否存在且进程正在运行
               if [ -f "${OPENVPN_DAEMON_PID_FILE}" ] && ps -p "$(cat ${OPENVPN_DAEMON_PID_FILE} 2>/dev/null)" > /dev/null 2>&1; then
-                  local daemon_pid=$(cat ${OPENVPN_DAEMON_PID_FILE})
+                  local daemon_pid=$(cat ${OPENVPN_DAEMON_PID_FILE}) # <-- daemon_pid 局部于函数
                   echo "[Cleanup] 尝试停止 OpenVPN 守护进程 (PID: $daemon_pid)..."
                   sudo kill "$daemon_pid" || true # 发送 SIGTERM 信号
                   sleep 2 # 等待进程退出
@@ -166,7 +211,7 @@
               echo "--- [阶段 3/3] 清理完成 ---"
           }
           # 设置 trap，在当前步骤退出时执行清理函数
-          trap cleanup_processes_step3 EXIT
+          trap cleanup_processes_step4 EXIT
 
           echo "--- [阶段 3/3] 启动持续外部网络检查循环 ---"
 
@@ -179,14 +224,16 @@
           # 无限循环进行网络检查
           while true; do
             echo "[Network Check] --- 外部检查开始 $(date) ---"
-            local TARGET_URL="https://www.google.com" # 检查外部连通性的目标 URL
+            # (无 local)
+            TARGET_URL="https://www.google.com" # 检查外部连通性的目标 URL
             # 使用 --fail 选项：如果 HTTP 状态码非 2xx 或发生连接错误，curl 将以非零退出码退出
             # 由于设置了 set -e，curl 失败将导致本脚本在此处立即终止
             if curl -sSL --fail --max-time 10 --connect-timeout 5 -o /dev/null "${TARGET_URL}"; then
               echo "[Network Check] ✓ ${TARGET_URL} 连接成功。" # 检查成功
             else
               # curl 失败时的日志信息
-              local STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
+              # (无 local)
+              STATUS_CODE=$(curl -sSL --max-time 10 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${TARGET_URL}" || echo "N/A")
               echo "[Network Check] ✗ ${TARGET_URL} 连接失败或异常响应 (状态码: ${STATUS_CODE})。本任务将退出。"
               exit 1 # 显式退出，触发 set -e 和 trap
             fi
