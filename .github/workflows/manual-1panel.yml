@@ -12,8 +12,8 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4 # 检出你的代码仓库
 
-      # --- 合并后的步骤：并发连接OpenVPN、运行脚本、循环检查网络 ---
-      - name: 并发：连接OpenVPN、验证内部访问并循环检查网络 (脚本稍后运行)
+      # --- 合并后的步骤：并发连接OpenVPN、验证内部访问并循环检查外部网络 (脚本稍后运行) ---
+      - name: 并发：连接OpenVPN、验证内部访问并循环检查外部网络
         run: |
           #!/bin/bash
           # 主脚本层面不使用 set -e，以便手动处理后台任务的成功/失败
@@ -66,8 +66,10 @@ jobs:
 
           # --- OpenVPN 连接与验证函数 (通过访问 http://12.0.0.1 并查找关键词) ---
           connect_vpn_and_verify() {
-              # 在此函数 (子shell) 内部启用 set -eux
-              set -eux
+              # 在此函数 (子shell) 内部启用 set -eux，除了 curl 的返回值检查
+              set -eu # 禁用 x，因为它在循环中会非常冗长
+              # set -x # 调试时可以启用
+
               echo "--- [VPN任务] 开始连接 OpenVPN ---"
               local OPENVPN_CONFIG_CONTENT="${{ secrets.OPENVPN_CONFIG }}"
               local CONFIG_DIR="/etc/openvpn/client"
@@ -103,13 +105,18 @@ jobs:
               local WAIT_PID_TIMEOUT=10
               local END_WAIT_PID=$((SECONDS + WAIT_PID_TIMEOUT))
               while [ $SECONDS -lt $END_WAIT_PID ]; do
+                  # 使用进程替换安全读取PID文件
                   if [ -f "${PID_FILE}" ] && [ -s "${PID_FILE}" ]; then
-                      OPENVPN_DAEMON_PID=$(cat ${PID_FILE})
+                      OPENVPN_DAEMON_PID=$(cat "${PID_FILE}")
                       if ps -p "$OPENVPN_DAEMON_PID" > /dev/null 2>&1; then
                           echo "[VPN任务] OpenVPN 守护进程已启动，PID: $OPENVPN_DAEMON_PID."
                           break
                       fi
-                  done < <(cat "${PID_FILE}") # Ensure cat is in process substitution to avoid issues
+                  fi
+                  sleep 1
+                  # 在某些环境中，直接在 read 或 $(cat) 后执行 done 会有问题
+                  # 将 done 放到 while 条件后更安全
+              done
 
               if [ ! -f "${PID_FILE}" ] || ! [ -s "${PID_FILE}" ] || ! ps -p "$(cat ${PID_FILE} 2>/dev/null)" > /dev/null 2>&1; then
                   echo "[VPN任务] ✗ 在 ${WAIT_PID_TIMEOUT} 秒内未检测到有效的 OpenVPN 守护进程 PID 或进程未运行。"
@@ -124,8 +131,8 @@ jobs:
               local END_TIME=$((SECONDS + TIMEOUT_SECONDS))
               # --- 内部验证目标 URL 和关键词 ---
               local TARGET_URL="http://12.0.0.1"
-              local KEYWORD1="系统"
-              local KEYWORD2="system"
+              local KEYWORD1="系统" # 中文关键词
+              local KEYWORD2="system" # 英文关键词
 
               while [ $SECONDS -lt $END_TIME ]; do
                 # 检查 OpenVPN 守护进程是否仍在运行 (通过PID文件)
@@ -137,34 +144,53 @@ jobs:
                 echo "[VPN任务] 尝试访问 ${TARGET_URL} 并查找 '${KEYWORD1}' 或 '${KEYWORD2}'... 剩余 $((END_TIME - SECONDS)) 秒"
 
                 local response_body=""
-                local curl_status=0 # Reset status
+                local http_status=""
+                local curl_exit_status=0 # Initialize exit status
 
-                # 使用 curl 获取响应体，失败时返回非零。捕获 stdout 作为响应体
-                # -s: silent, -S: show errors if silent fails, -L: follow redirects (optional), --fail: fail on non-2xx HTTP responses
-                # --max-time: total operation timeout, --connect-timeout: only connection phase timeout
-                response_body=$(curl -sSL --fail --max-time 15 --connect-timeout 10 "$TARGET_URL")
-                curl_status=$? # Capture curl exit status
+                # 使用 curl 获取响应体和 HTTP 状态码
+                # -sSL: silent, show errors, follow redirects
+                # -w "%{http_code}": output HTTP status code on stdout after body
+                # --max-time: total operation timeout
+                # --connect-timeout: only connection phase timeout
+                # 管道符 | 用于将 stdout 分割，不使用 --fail 避免 set -e 提前退出
+                # 明确检查 curl 退出码和 http 状态
+                response_and_status=$(curl -sSL --max-time 15 --connect-timeout 10 "$TARGET_URL")
+                curl_exit_status=$? # Capture curl's exit status
 
-                if [ "$curl_status" -eq 0 ]; then
-                     # curl 成功 (HTTP status was 2xx)
-                     # 检查响应体是否包含任一关键词
-                     if echo "$response_body" | grep -qE "$KEYWORD1|$KEYWORD2"; then
-                         echo "[VPN任务] ✓ 成功访问 ${TARGET_URL} 并找到关键词。VPN 连接验证成功。"
-                         # 如果需要，可以在这里尝试设置 DETECTED_VPN_IFACE，但它不再是验证成功的必要条件
-                         echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
-                         exit 0 # 表示此函数成功
-                     else
-                         echo "[VPN任务] ✗ 成功访问 ${TARGET_URL}，但响应体未找到关键词 '${KEYWORD1}' 或 '${KEYWORD2}'。"
-                         # 打印响应体的前200个字符，用于调试
-                         echo "[VPN任务] (部分响应体: $(echo "$response_body" | head -c 200))..."
-                     fi
+                if [ "$curl_exit_status" -eq 0 ]; then
+                    # curl 命令本身成功执行 (例如，连接建立并开始传输)
+                    # 从输出中分离响应体和状态码 (状态码是最后一行)
+                    http_status=$(echo "$response_and_status" | tail -n 1)
+                    response_body=$(echo "$response_and_status" | sed '$d') # 移除最后一行获取响应体
+
+                    # 检查 HTTP 状态码是否为 2xx (表示成功响应)
+                    if [[ "$http_status" =~ ^2[0-9]{2}$ ]]; then
+                        # HTTP 状态码是 2xx，现在检查响应体内容
+                        # grep -qE: quiet, extended regex (for |), return 0 if match, 1 if no match
+                        if echo "$response_body" | grep -qE "$KEYWORD1|$KEYWORD2"; then
+                            # 找到了关键词 - 验证成功！
+                            echo "[VPN任务] ✓ 成功访问 ${TARGET_URL} (HTTP ${http_status}) 并找到关键词。VPN 连接验证成功。"
+                            echo "[VPN任务] --- OpenVPN 连接步骤完成 ---"
+                            exit 0 # 表示此函数成功
+                        else
+                            # HTTP 状态码 2xx，但未找到关键词
+                            echo "[VPN任务] ✗ 成功访问 ${TARGET_URL} (HTTP ${http_status})，但响应体未找到关键词 '${KEYWORD1}' 或 '${KEYWORD2}'。"
+                            # 打印响应体的前200个字符，用于调试
+                            echo "[VPN任务] (部分响应体: $(echo "$response_body" | head -c 200))..."
+                        fi
+                    else
+                        # curl 命令成功，但 HTTP 状态码不是 2xx (例如 404, 500)
+                        echo "[VPN任务] ✗ 访问 ${TARGET_URL} 失败。收到非 2xx HTTP 状态码: ${http_status}。"
+                        echo "[VPN任务] (部分响应体: $(echo "$response_body" | head -c 200))..."
+                    fi
                 else
-                    # curl 失败 (连接问题，超时，非2xx HTTP状态等)
-                    echo "[VPN任务] ✗ 访问 ${TARGET_URL} 失败。Curl exited with: ${curl_status}."
+                    # curl 命令本身失败 (例如，连接被拒绝，超时，DNS 错误等)
+                    echo "[VPN任务] ✗ 访问 ${TARGET_URL} 失败。Curl 命令退出码: ${curl_exit_status}."
                     # 针对常见的 curl 错误码提供更多信息
-                    if [ "$curl_status" -eq 6 ]; then echo "[VPN任务] (错误详情: 无法解析或连接主机)"; fi
-                    if [ "$curl_status" -eq 7 ]; then echo "[VPN任务] (错误详情: 连接被拒绝)"; fi
-                    if [ "$curl_status" -eq 28 ]; then echo "[VPN任务] (错误详情: 连接超时)"; fi
+                    if [ "$curl_exit_status" -eq 6 ]; then echo "[VPN任务] (错误详情: 无法解析或连接主机)"; fi
+                    if [ "$curl_exit_status" -eq 7 ]; then echo "[VPN任务] (错误详情: 连接被拒绝)"; fi
+                    if [ "$curl_exit_status" -eq 28 ]; then echo "[VPN任务] (错误详情: 连接超时)"; fi
+                    # 注意：其他错误码如 22 (HTTP 错误，但这里不使用 --fail 了) 也可能出现
                 fi
 
                 sleep 10 # 每次检查之间等待10秒
@@ -199,24 +225,24 @@ jobs:
               exit 0
             }
 
-            # --- 循环检查网络函数 ---
+            # --- 循环检查外部网络函数 ---
             run_network_check_loop() {
                 # 在此函数内部启用 set -e，以便 curl --fail 失败时此后台进程会退出
                 set -e
-                echo "--- [网络检查任务] 开始持续检查网络连接 (每隔 1 分钟一次) ---"
+                echo "--- [网络检查任务] 开始持续检查外部网络连接 (每隔 1 分钟一次) ---"
 
                 # 在开始正式循环前，可以给一点额外时间或做一个快速的网络状态确认
-                echo "[网络检查任务] 等待30秒，确保网络环境稳定..."
+                echo "[网络检查任务] 等待30秒，确保外部网络环境稳定..."
                 sleep 30
 
                 # 这个函数现在在主逻辑中与 VPN 连接任务同时启动
                 # 它自己的检查会独立进行，并在 curl 失败时导致整个步骤失败
-                # 循环开始前的 VPN 状态检查（如检查 tun0）在此验证模式下意义较小，
+                # 循环开始前的 VPN 状态检查（如检查 tun0 或路由）在此验证模式下意义较小，
                 # 主要依赖循环内部的 curl 检查是否能够通过 VPN 路由的出口进行。
 
                 echo "[网络检查任务] 循环开始前的网络状态简要检查:"
                 ip route show default || echo "无法获取默认路由"
-                # 检查 12.0.0.1 是否可达 (可选，第一次尝试)
+                # 检查 12.0.0.1 是否可达 (可选，第一次尝试，但不检查内容)
                 # curl -sSL --fail --max-time 5 --connect-timeout 3 http://12.0.0.1 >/dev/null 2>&1 && echo "[网络检查任务] 12.0.0.1 似乎可达。" || echo "[网络检查任务] 12.0.0.1 似乎不可达。"
 
 
@@ -296,3 +322,5 @@ jobs:
 
         shell: bash # 明确使用bash执行脚本
 
+      # --- 原有的循环检查网络连接步骤 已被合并到上一步 ---
+      # 此步骤已移除，因为功能合并到了上一步
